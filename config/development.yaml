@@ -1,0 +1,3 @@
+database:
+  url: "postgresql://postgres:postgres@localhost:5432/thermognosis_dev"
+  pool_size: 5

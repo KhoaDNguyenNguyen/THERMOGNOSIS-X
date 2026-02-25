@@ -1,0 +1,15 @@
+database:
+  url: "postgresql://postgres:postgres@db:5432/thermognosis"
+  pool_size: 20
+
+pipeline:
+  batch_size: 2000
+  deterministic: false
+  max_workers: 16
+
+rust:
+  enable_parallel: true
+
+logging:
+  level: "WARNING"
+  structured: true

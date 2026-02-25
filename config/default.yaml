@@ -1,0 +1,16 @@
+database:
+  url: "postgresql://postgres:postgres@localhost:5432/thermognosis"
+  pool_size: 5
+
+pipeline:
+  batch_size: 500
+  deterministic: true
+  max_workers: 4
+
+rust:
+  library_path: "rust_core/target/release/librust_core.so"
+  enable_parallel: false
+
+logging:
+  level: "INFO"
+  structured: false
