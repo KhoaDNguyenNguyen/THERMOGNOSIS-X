@@ -44,6 +44,17 @@ logs/*.log
 data/raw/*
 
 data/processed/*
-
+data/
+doc/
 !data/.gitkeep
 
+thermognosis-engine/
+rust_core/target
+rust_core/Cargo.lock 
+rust_core/Cargo.toml.txt
+.pytest_cache/
+.directory
+flatten.py
+.gitignore
+/flattened_workspace
+crawl.log
