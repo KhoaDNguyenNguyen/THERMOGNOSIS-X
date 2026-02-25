@@ -1,0 +1,42 @@
+[package]
+name = "rust_core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Thermognosis Research Group"]
+description = "High-performance thermoelectric physics engine for THERMOGNOSIS"
+license = "MIT"
+
+[lib]
+name = "rust_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# --- CORE FFI (Python <-> Rust) ---
+# Update lên 0.21 để hỗ trợ Python 3.12+ tốt nhất
+# 'abi3-py39' giúp binary tương thích từ Python 3.9 trở lên
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py39"] }
+numpy = "0.21"
+
+# --- MATH & DATA STRUCTURES ---
+# Thêm ndarray để hỗ trợ rust-numpy tốt hơn (dependency ngầm định)
+ndarray = "0.15" 
+
+# --- PARALLELISM & ERROR HANDLING ---
+rayon = "1.10"      # Update bản mới nhất để tối ưu thread pool
+thiserror = "1.0"
+
+# --- SERIALIZATION & I/O ---
+# 'derive' cần thiết để mapping struct trực tiếp từ CSV/JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.3"
+
+# --- PERFORMANCE ---
+ahash = "0.8"
+
+[profile.release]
+opt-level = 3       # Tối ưu tối đa tốc độ
+lto = "fat"         # Link Time Optimization: gom code để inline tốt hơn (thay vì true/thin)
+codegen-units = 1   # Giảm song song khi compile để code sinh ra nhanh hơn (dù build lâu hơn)
+panic = "abort"     # Giảm kích thước binary, không unwind stack khi lỗi (pyo3 sẽ bắt lỗi trước)
+strip = true        # Xóa debug symbols để file .so/.pyd nhẹ hơn
