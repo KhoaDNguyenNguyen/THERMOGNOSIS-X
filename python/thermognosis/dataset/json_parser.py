@@ -172,13 +172,25 @@ def parse_sample_json(file_path: Path) -> Tuple[SampleRecord, List[DataPointReco
         # raw_figures = raw_data.get('figure_ids',[])
         # figure_ids = tuple(int(fid) for fid in raw_figures)
         # Starrydata format: sample is a list
+        # sample_block = raw_data["sample"][0]
+        # data_type = (
+        #     sample_block
+        #     .get("sampleinfo",{})
+        #     .get("DataType",{})
+        #     .get("category","Unknown")
+        # )
         sample_block = raw_data["sample"][0]
-        data_type = (
-            sample_block
-            .get("sampleinfo",{})
-            .get("DataType",{})
-            .get("category","Unknown")
-        )
+        
+        # Trích xuất an toàn (Defensive Extraction) để chống dirty data
+        sampleinfo = sample_block.get("sampleinfo", {})
+        if not isinstance(sampleinfo, dict):
+            sampleinfo = {}
+            
+        datatype_info = sampleinfo.get("DataType", {})
+        if not isinstance(datatype_info, dict):
+            datatype_info = {}
+            
+        data_type = datatype_info.get("category", "Unknown")
         sample_id = int(sample_block["sampleid"])
 
         composition = str(
