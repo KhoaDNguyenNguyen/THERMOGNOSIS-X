@@ -13,6 +13,8 @@ pub enum CsvEngineError {
     CsvError(#[from] csv::Error),
     #[error("Epistemological Data Violation: Required columns not found.")]
     MissingRequiredColumns,
+    #[error("Missing Thermo Columns: No Seebeck, Conductivity, or Thermal Conductivity found.")]
+    MissingThermoColumns,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,6 +74,12 @@ pub fn compute_zt_from_csv(path: &str, _deterministic: bool) -> Result<Benchmark
     }
 
     if t_cols.is_empty() { return Err(CsvEngineError::MissingRequiredColumns); }
+    if s_cols.is_empty() &&
+       sigma_cols.is_empty() &&
+       rho_cols.is_empty() &&
+       kappa_cols.is_empty() {
+        return Err(CsvEngineError::MissingThermoColumns);
+    }
 
     let mut record = csv::StringRecord::new();
     let mut state_map: HashMap<StateKey, ThermoState> = HashMap::new();

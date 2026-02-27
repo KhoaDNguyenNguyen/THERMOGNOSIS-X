@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Generator, Set
-
+import csv
 from tqdm import tqdm
 
 # =============================================================================
@@ -82,100 +82,139 @@ def _setup_logger() -> logging.Logger:
 
 logger = _setup_logger()
 
+# =============================================================================
+# PROPERTY FILTER CONFIGURATION
+# =============================================================================
+
+ALLOWED_PROPERTIES = {
+
+    "Thermal conductivity",
+    "Seebeck coefficient",
+    "Electrical resistivity",
+    "Electrical conductivity",
+    "ZT"
+
+}
 
 # =============================================================================
 # ORCHESTRATION PIPELINE
 # =============================================================================
 
 def execute_normalization_pipeline(input_dir: Path, output_file: Path, batch_size: int) -> None:
-    """
-    Executes the memory-bounded, O(N) streaming ingestion of materials data.
-    
-    Mathematical & Computational Constraints:
-    - Maintains O(1) memory bound for record handling.
-    - Aggregates metadata tracking (Unique Samples/Papers) using hashed Sets,
-      which operate in O(U) space where U is the number of unique IDs.
-      
-    Parameters
-    ----------
-    input_dir : Path
-        Absolute or relative path to the nested directories of raw JSONs.
-    output_file : Path
-        Target destination for the structurally enforced Parquet array.
-    batch_size : int
-        Chunking integer for the columnar batch writer to optimize I/O.
-        
-    Raises
-    ------
-    ThermognosisError
-        If structural metadata or thermodynamic invariants are violated.
-    """
     logger.info("Initializing Thermognosis Normalization Pipeline...")
     logger.info(f"Input Directory : {input_dir}")
     logger.info(f"Output Target   : {output_file}")
     logger.info(f"I/O Batch Size  : {batch_size}")
 
-    # Telemetry and Observability Trackers
+    # Telemetry Trackers cho Data Hợp lệ
     unique_samples: Set[int] = set()
     unique_papers: Set[int] = set()
     total_datapoints = 0
+    
+    # Trackers Phân loại Rác (Garbage Classification)
+    rejected_epistemic: Set[int] = set()  # Bị loại do không phải Thực Nghiệm
+    rejected_domain: Set[int] = set()     # Bị loại do khác Lĩnh vực (VD: Quang học)
 
-    def record_stream() -> Generator[ParquetDataPointRecord, None, None]:
-        """
-        Inner generator linking the JSON Epistemic Bridge to the Parquet Writer.
-        Extracts records lazily, merging Sample metadata with Point invariants.
-        """
-        nonlocal total_datapoints
-        
-        # dynamic_ncols ensures the progress bar scales gracefully across terminals
-        with tqdm(desc="Normalizing Thermodynamic Data", unit=" pts", dynamic_ncols=True) as pbar:
-            for sample_record, data_point in stream_samples(input_dir):
-                
-                # Update invariant telemetry
-                unique_samples.add(sample_record.sample_id)
-                unique_papers.add(sample_record.paper_id)
-                total_datapoints += 1
-                pbar.update(1)
-                
-                # Yield the strictly typed, flattened Parquet format.
-                yield ParquetDataPointRecord(
-                    sample_id=sample_record.sample_id,
-                    composition=sample_record.composition,
-                    paper_id=sample_record.paper_id,
-                    property_x=data_point.property_x,
-                    property_y=data_point.property_y,
-                    unit_x=data_point.unit_x,
-                    unit_y=data_point.unit_y,
-                    x=data_point.x,
-                    y=data_point.y
+    rejection_log_path = output_file.parent / "rejected_lineage_log.csv"
+    logger.info(f"Provenance Log  : {rejection_log_path}")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(rejection_log_path, mode="w", newline="", encoding="utf-8") as rejection_file:
+        csv_writer = csv.writer(rejection_file)
+        # Bổ sung cột rejection_reason để dễ filter sau này
+        csv_writer.writerow(["sample_id", "paper_id", "composition", "measurement_type", "rejection_reason"])
+
+        def record_stream() -> Generator[ParquetDataPointRecord, None, None]:
+            nonlocal total_datapoints
+            
+            with tqdm(desc="Normalizing Thermodynamic Data", unit=" pts", dynamic_ncols=True) as pbar:
+                stream = stream_samples(
+                    directory=input_dir, 
+                    allowed_types=("Experiment", "Theory", "Simulation", "Unknown", "Review")
                 )
+                
+                for sample_record, data_point in stream:
+                    sample_id = sample_record.sample_id
+                    
+                    # ---------------------------------------------------------
+                    # 1. BỘ LỌC NGUỒN GỐC (EPISTEMIC FILTER)
+                    # ---------------------------------------------------------
+                    if sample_record.measurement_type != "Experiment":
+                        if sample_id not in rejected_epistemic:
+                            csv_writer.writerow([
+                                sample_id, sample_record.paper_id, sample_record.composition,
+                                sample_record.measurement_type, "Non-Experimental Origin"
+                            ])
+                            rejected_epistemic.add(sample_id)
+                        continue
 
-    # Core Execution Block
-    start_time = time.perf_counter()
-    try:
-        # Pushes the generator into the chunked writer
-        write_parquet(
-            records=record_stream(), 
-            output_path=output_file, 
-            batch_size=batch_size
-        )
-    except Exception as e:
-        logger.error(f"[FATAL] Irrecoverable failure during Parquet serialization: {e}")
-        raise
+                    # ---------------------------------------------------------
+                    # 2. BỘ LỌC LĨNH VỰC (DOMAIN FILTER)
+                    # ---------------------------------------------------------
+                    if data_point.property_x != "Temperature" or data_point.property_y not in ALLOWED_PROPERTIES:
+                        # Chỉ log nếu sample này chưa từng được tính là hợp lệ hoặc chưa bị log trước đó
+                        if sample_id not in rejected_domain and sample_id not in unique_samples:
+                            csv_writer.writerow([
+                                sample_id, sample_record.paper_id, sample_record.composition,
+                                sample_record.measurement_type, f"Non-Thermo Property ({data_point.property_y})"
+                            ])
+                            rejected_domain.add(sample_id)
+                        continue
+                    
+                    # ---------------------------------------------------------
+                    # 3. DỮ LIỆU ĐẠT CHUẨN (VALID YIELD)
+                    # ---------------------------------------------------------
+                    # Nếu một mẫu lỡ bị đánh dấu "rác" trước đó (do JSON có mix cả data tốt lẫn xấu),
+                    # ta gỡ nó ra khỏi danh sách rác để đếm số liệu thống kê cho chuẩn.
+                    if sample_id in rejected_domain:
+                        rejected_domain.remove(sample_id)
+
+                    unique_samples.add(sample_id)
+                    unique_papers.add(sample_record.paper_id)
+                    total_datapoints += 1
+                    pbar.update(1)
+                    
+                    yield ParquetDataPointRecord(
+                        sample_id=sample_id,
+                        composition=sample_record.composition,
+                        paper_id=sample_record.paper_id,
+                        property_x=data_point.property_x,
+                        property_y=data_point.property_y,
+                        unit_x=data_point.unit_x,
+                        unit_y=data_point.unit_y,
+                        x=data_point.x,
+                        y=data_point.y
+                    )
+
+        # Ghi trực tiếp xuống Parquet
+        start_time = time.perf_counter()
+        try:
+            write_parquet(records=record_stream(), output_path=output_file, batch_size=batch_size)
+        except Exception as e:
+            logger.error(f"[FATAL] Irrecoverable failure during Parquet serialization: {e}")
+            raise
 
     elapsed_time = time.perf_counter() - start_time
 
-    # Output highly visible, publication-ready statistical telemetry
+    # =====================================================================
+    # IN RA BẢNG TELEMETRY PHÂN LOẠI CHI TIẾT
+    # =====================================================================
     logger.info("Normalization Pipeline Completed Successfully.")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
     logger.info(" THERMOGNOSIS ENGINE : COMPUTATIONAL PIPELINE TELEMETRY")
-    logger.info("=" * 60)
-    logger.info(f" Execution Time (Wall)      : {elapsed_time:.3f} seconds")
-    logger.info(f" Processing Throughput      : {total_datapoints / max(elapsed_time, 0.001):.1f} pts/sec")
-    logger.info(f" Total Unique Samples Parsed: {len(unique_samples):,}")
-    logger.info(f" Total Papers Processed     : {len(unique_papers):,}")
-    logger.info(f" Total DataPoints Extracted : {total_datapoints:,}")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info(f" Execution Time (Wall)           : {elapsed_time:.3f} seconds")
+    logger.info(f" Processing Throughput           : {total_datapoints / max(elapsed_time, 0.001):.1f} pts/sec")
+    logger.info("-" * 65)
+    logger.info(f" Valid Experimental Samples      : {len(unique_samples):,}")
+    logger.info(f" Total Papers Assessed           : {len(unique_papers):,}")
+    logger.info(f" Total Thermo DataPoints Yielded : {total_datapoints:,}")
+    logger.info("-" * 65)
+    logger.info(f" Rejected (Non-Experimental)     : {len(rejected_epistemic):,} samples")
+    logger.info(f" Rejected (Non-Thermoelectric)   : {len(rejected_domain):,} samples")
+    logger.info(f" Rejection Lineage Log           : {rejection_log_path.name}")
+    logger.info("=" * 65)
 
 
 # =============================================================================

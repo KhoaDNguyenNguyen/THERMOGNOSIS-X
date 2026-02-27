@@ -20,6 +20,43 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+def classify_experiment_type(sample):
+    """
+    Return:
+        'experimental'
+        'simulation'
+        'theory'
+        'unknown'
+    """
+
+    # text = str(sample).lower()
+    text = " ".join(str(v) for v in sample.values()).lower()
+
+    if any(k in text for k in [
+        "measured",
+        "experiment",
+        "sample",
+        "synthesis",
+        "fabricated"
+    ]):
+        return "experimental"
+
+    if any(k in text for k in [
+        "simulation",
+        "simulated",
+        "dft",
+        "calculated"
+    ]):
+        return "simulation"
+
+    if any(k in text for k in [
+        "model",
+        "theory",
+        "theoretical"
+    ]):
+        return "theory"
+
+    return "unknown"
 
 # -----------------------------------------------------------------------------
 # Global Conventions & System Constants
@@ -156,7 +193,20 @@ class MeasurementIngestor:
     Ensures that no physical impossibilities or epistemic gaps enter the system.
     """
     
-    def __init__(self, check_wiedemann_franz: bool = True):
+    # def __init__(self, check_wiedemann_franz: bool = True):
+    def __init__(
+        self,
+        check_wiedemann_franz: bool = True,
+        allowed_experiment_types=None
+    ):
+
+        self.check_wiedemann_franz = check_wiedemann_franz
+
+        if allowed_experiment_types is None:
+            allowed_experiment_types = {"experimental"}
+
+        self.allowed_experiment_types = allowed_experiment_types
+
         self.check_wiedemann_franz = check_wiedemann_franz
 
     def _validate_mandatory_fields(self, record: Dict[str, Any]) -> None:
@@ -306,15 +356,45 @@ class MeasurementIngestor:
             raise ThermognosisMissingDataError(f"DataFrame is missing structurally required columns: {missing}")
 
         entities = []
+
+        skipped = 0
+
         for row in df.itertuples(index=False):
+
             record_dict = row._asdict()
+
+            # -------- EXPERIMENT FILTER --------
+            exp_type = classify_experiment_type(record_dict)
+
+            if exp_type not in self.allowed_experiment_types:
+
+                skipped += 1
+
+                continue
+
+            # -----------------------------------
+
             try:
                 entity = self.ingest_record(record_dict)
                 entities.append(entity)
+
             except ThermognosisError as e:
                 # In strict environments, any single failure poisons the batch to prevent partial-state corruption.
                 logger.error(f"Ingestion failed for MAT_ID={record_dict.get('mat_id')} at row indexing. Error: {str(e)}")
                 raise
 
-        logger.info(f"Successfully ingested {len(entities)} raw measurements. Spec Version: {SPEC_VERSION}")
+        # logger.info(f"Successfully ingested {len(entities)} raw measurements. Spec Version: {SPEC_VERSION}")
+        # logger.info(
+        #     f"Ingested {len(entities)} experimental measurements "
+        #     f"(skipped {skipped} non-experimental). "
+        #     f"Spec Version: {SPEC_VERSION}"
+        # )
+        logger.info(
+            f"Ingested {len(entities)} measurements "
+            f"(skipped {skipped}). "
+            f"Allowed types = {self.allowed_experiment_types}. "
+            f"Spec Version: {SPEC_VERSION}"
+        )
+
+
         return entities

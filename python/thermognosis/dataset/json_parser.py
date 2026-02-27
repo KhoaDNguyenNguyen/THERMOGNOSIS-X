@@ -53,6 +53,7 @@ class SampleRecord:
     composition: str
     paper_id: int
     figure_ids: Tuple[int, ...]
+    measurement_type: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,19 +144,61 @@ def parse_sample_json(file_path: Path) -> Tuple[SampleRecord, List[DataPointReco
 
     # Stage 1: Critical Metadata Extraction
     try:
-        sample_id = int(raw_data['sample_id'])
-        composition = str(raw_data['composition'])
-        paper_id = int(raw_data['paper_id'])
-        
-        # safely coerce figures into an immutable tuple of ints
-        raw_figures = raw_data.get('figure_ids',[])
-        figure_ids = tuple(int(fid) for fid in raw_figures)
-        
+        # sample_id = int(raw_data['sample_id'])
+        # sample_id = int(raw_data.get('sample_id', raw_data.get('sampleid')))
+        # # composition = str(raw_data['composition'])
+        # composition = str(raw_data.get('composition', raw_data.get('chemical_formula', 'UNKNOWN')))
+        # paper_id = int(raw_data['paper_id'])
+        # ---- Robust sample_id extraction ----
+        # raw_sample_id = raw_data.get('sample_id') or raw_data.get('sampleid')
+        # if raw_sample_id is None:
+        #     raise ValueError("Missing sample_id")
+        # sample_id = int(raw_sample_id)
+
+        # # ---- Composition ----
+        # composition = str(
+        #     raw_data.get('composition')
+        #     or raw_data.get('chemical_formula')
+        #     or "UNKNOWN"
+        # )
+
+        # # ---- Robust paper_id extraction ----
+        # raw_paper_id = raw_data.get('paper_id') or raw_data.get('paperid')
+        # if raw_paper_id is None:
+        #     raise ValueError("Missing paper_id")
+        # paper_id = int(raw_paper_id)
+
+        # # safely coerce figures into an immutable tuple of ints
+        # raw_figures = raw_data.get('figure_ids',[])
+        # figure_ids = tuple(int(fid) for fid in raw_figures)
+        # Starrydata format: sample is a list
+        sample_block = raw_data["sample"][0]
+        data_type = (
+            sample_block
+            .get("sampleinfo",{})
+            .get("DataType",{})
+            .get("category","Unknown")
+        )
+        sample_id = int(sample_block["sampleid"])
+
+        composition = str(
+            sample_block.get("composition","UNKNOWN")
+        )
+
+        paper_id = int(sample_block["paperid"])
+
+        # figure ids extracted from rawdata
+        figure_ids = tuple(
+            int(d["figureid"])
+            for d in raw_data.get("rawdata",[])
+        )
+
         sample_record = SampleRecord(
             sample_id=sample_id,
             composition=composition,
             paper_id=paper_id,
-            figure_ids=figure_ids
+            figure_ids=figure_ids,
+            measurement_type=data_type
         )
     except (KeyError, ValueError, TypeError) as e:
         logger.error(f"[FATAL] Schema mismatch in sample metadata {file_path}: {e}")
@@ -163,7 +206,8 @@ def parse_sample_json(file_path: Path) -> Tuple[SampleRecord, List[DataPointReco
 
     # Stage 2: Data Point Normalization
     data_points: List[DataPointRecord] = []
-    raw_points = raw_data.get('data_points',[])
+    # raw_points = raw_data.get('data_points',[])
+    raw_points = raw_data.get("rawdata",[])
     
     if not isinstance(raw_points, list):
         logger.warning(f"[WARN] 'data_points' is not iterable in {file_path}. Defaulting to empty.")
@@ -178,16 +222,48 @@ def parse_sample_json(file_path: Path) -> Tuple[SampleRecord, List[DataPointReco
             if math.isnan(x_val) or math.isnan(y_val) or math.isinf(x_val) or math.isinf(y_val):
                 raise ValueError("Encountered NaN or Inf thermodynamic artifact.")
 
+            # dp = DataPointRecord(
+            #     sample_id=sample_id,
+            #     property_x=str(pt['property_x']),
+            #     property_y=str(pt['property_y']),
+            #     unit_x=str(pt['unit_x']),
+            #     unit_y=str(pt['unit_y']),
+            #     x=x_val,
+            #     y=y_val
+            # )
+            # Build property lookup
+            property_lookup = {
+                p["propertyid"]: (p["propertyname"], p["unit"])
+                for p in raw_data.get("property",[])
+            }
+
+            prop_x,unit_x = property_lookup.get(
+                pt["propertyid_x"],
+                ("UNKNOWN","")
+            )
+
+            prop_y,unit_y = property_lookup.get(
+                pt["propertyid_y"],
+                ("UNKNOWN","")
+            )
+
             dp = DataPointRecord(
                 sample_id=sample_id,
-                property_x=str(pt['property_x']),
-                property_y=str(pt['property_y']),
-                unit_x=str(pt['unit_x']),
-                unit_y=str(pt['unit_y']),
+                property_x=prop_x,
+                property_y=prop_y,
+                unit_x=unit_x,
+                unit_y=unit_y,
                 x=x_val,
                 y=y_val
             )
+
             data_points.append(dp)
+            # if (
+            #     dp.property_x == "Temperature"
+            #     and dp.property_y in ALLOWED_Y
+            # ):
+            #     data_points.append(dp)
+
         except (KeyError, ValueError, TypeError) as e:
             # Graceful degradation: Log and skip only the specific malformed point
             logger.warning(f"[WARN] Skipping malformed point index {idx} in {file_path}: {e}")
@@ -232,8 +308,18 @@ def parse_paper_json(file_path: Path) -> PaperRecord:
         logger.error(f"[FATAL] Invalid paper schema in {file_path}: {e}")
         raise ParserError(f"Schema error on {file_path}") from e
 
+ALLOWED_Y = {
+    "Thermal conductivity",
+    "Seebeck coefficient",
+    "Electrical resistivity",
+    "Electrical conductivity",
+    "ZT"
+}
 
-def stream_samples(directory: Path) -> Generator[Tuple[SampleRecord, DataPointRecord], None, None]:
+def stream_samples(
+                    directory: Path,
+                    allowed_types=("Experiment",)
+                )-> Generator[Tuple[SampleRecord, DataPointRecord], None, None]:
     """
     Lazy-loads and yields parsed data point tuples sequentially from a directory.
     
@@ -258,6 +344,13 @@ def stream_samples(directory: Path) -> Generator[Tuple[SampleRecord, DataPointRe
     for file_path in directory.rglob("*.json"):
         try:
             sample_record, data_points = parse_sample_json(file_path)
+            if sample_record.measurement_type not in allowed_types:
+                logger.info(
+                    f"[FILTER] Reject sample {sample_record.sample_id} "
+                    f"type={sample_record.measurement_type}"
+                )
+                continue
+
             for dp in data_points:
                 yield (sample_record, dp)
         except ParserError as e:
