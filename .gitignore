@@ -58,3 +58,4 @@ flatten.py
 .gitignore
 /flattened_workspace
 crawl.log
+dataset/processed/
