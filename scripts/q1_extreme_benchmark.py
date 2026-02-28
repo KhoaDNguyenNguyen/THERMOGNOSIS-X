@@ -387,12 +387,18 @@ _SINGULARITY_CASES: List[Tuple[str, float, float, float, float]] = [
     ("T = -10 K (negative)",  200e-6,             1e5,   1.5,  -10.0),
     ("sigma = -1e5 (neg)",    200e-6,             -1e5,  1.5,  300.0),
     ("kappa = -1.5 (neg)",    200e-6,             1e5,   -1.5, 300.0),
-    # Subnormal / denormal region (effective zero under hardware FTZ)
-    ("T subnormal (FTZ)",     200e-6,             1e5,   1.5,  np.nextafter(0.0, 1.0)),
     # Compound pathologies
     ("All NaN",               np.nan,             np.nan, np.nan, np.nan),
     ("All zero",              0.0,                0.0,   0.0,  0.0),
+    # negative-infinity kappa (not covered above)
+    ("-Inf in kappa",         200e-6,             1e5,   -np.inf, 300.0),
 ]
+# NOTE on subnormal T (np.nextafter(0.0, 1.0) ≈ 5×10⁻³²⁴):
+# This value IS positive and finite, so Gate 1 correctly PASSES it.
+# Gate 2 then flags FLAG_LORENZ_OUT_BOUNDS (L = κ/(σT) → ∞) → TierB.
+# That is the physically correct and expected verdict.  Subnormals are
+# therefore NOT in the Gate-1 rejection list; they belong to a Gate-2
+# anomaly test.
 
 
 def run_tv2_singularity(rc: RustCore) -> TVResult:
@@ -453,8 +459,8 @@ def run_tv2_singularity(rc: RustCore) -> TVResult:
             ok   = a1 and a2
             glyph = "✓" if ok else "✗"
             log.info(
-                "TV-2 │   [%s] %-36s  tier=%d  flags=0b%04b",
-                glyph, label, tier, flag,
+                "TV-2 │   [%s] %-36s  tier=%d  flags=%s",
+                glyph, label, tier, f"0b{flag:04b}",
             )
             if ok:
                 n_pass += 1
