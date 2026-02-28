@@ -39,6 +39,9 @@ pub mod bayesian;
 pub mod ranking_core;
 pub mod information_gain;
 
+// Epistemic Quality Gate — Triple-Gate Physics Arbiter (SPEC-AUDIT-01)
+pub mod audit;
+
 // Export ThermoError centrally to satisfy crate-level internal references
 pub use bayesian::ThermoError;
 
@@ -508,6 +511,104 @@ pub fn compute_information_gain_batch_py<'py>(
 }
 
 // ============================================================================
+// TRIPLE-GATE EPISTEMIC AUDIT (SPEC-AUDIT-01)
+// ============================================================================
+
+/// Performs the Triple-Gate physics audit over a complete thermodynamic dataset,
+/// assigning a `ConfidenceTier` and `AnomalyFlags` bitmask to every state.
+///
+/// Passes execution to `audit::audit_dataset_batch_par` (Rayon) when
+/// `deterministic=False`, or falls back to a strictly ordered iterator for
+/// reproducible pipeline generation.
+///
+/// # Returns (via Python dict)
+/// A dictionary with six flat `numpy.ndarray` columns:
+/// - `"tiers"` (`uint8`):         Ordinal confidence tier (1=A, 2=B, 3=C, 4=Reject).
+/// - `"anomaly_flags"` (`uint32`): Bitmask of detected anomaly flags.
+/// - `"zT_computed"` (`float64`):  Computed figure of merit S²σT/κ.
+/// - `"kappa_lattice"` (`float64`): Residual lattice κ = κ − L₀σT.
+/// - `"lorenz_number"` (`float64`): Effective Lorenz number L = κ/(σT).
+/// - `"cross_check_error"` (`float64`): Relative zT deviation (NaN where unavailable).
+///
+/// # Document IDs
+/// SPEC-AUDIT-01, P04-WIEDEMANN-FRANZ-LIMIT
+#[pyfunction]
+#[pyo3(signature = (s, sigma, kappa, t, zt_reported, deterministic=false))]
+#[allow(clippy::too_many_arguments)]
+pub fn audit_thermodynamics_py<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    sigma: PyReadonlyArray1<'py, f64>,
+    kappa: PyReadonlyArray1<'py, f64>,
+    t: PyReadonlyArray1<'py, f64>,
+    zt_reported: PyReadonlyArray1<'py, f64>,
+    deterministic: bool,
+) -> PyResult<PyObject> {
+    let s_slice       = extract_slice!(s,           "S");
+    let sigma_slice   = extract_slice!(sigma,       "sigma");
+    let kappa_slice   = extract_slice!(kappa,       "kappa");
+    let t_slice       = extract_slice!(t,           "T");
+    let zt_slice      = extract_slice!(zt_reported, "zt_reported");
+
+    let n = enforce_equal_lengths(&[
+        s_slice.len(),
+        sigma_slice.len(),
+        kappa_slice.len(),
+        t_slice.len(),
+        zt_slice.len(),
+    ])?;
+
+    // Relinquish the GIL and dispatch to the physics kernel.
+    let records = py.allow_threads(|| {
+        if deterministic {
+            // Strictly ordered sequential iteration for reproducible builds.
+            let recs = s_slice
+                .iter()
+                .zip(sigma_slice)
+                .zip(kappa_slice)
+                .zip(t_slice)
+                .zip(zt_slice)
+                .map(|((((si, sigi), kapi), ti), zti)| {
+                    audit::triple_check_physics(*si, *sigi, *kapi, *ti, *zti)
+                })
+                .collect::<Vec<_>>();
+            Ok(recs)
+        } else {
+            audit::audit_dataset_batch_par(s_slice, sigma_slice, kappa_slice, t_slice, zt_slice)
+        }
+    })
+    .map_err(|e: audit::AuditError| PyValueError::new_err(e.to_string()))?;
+
+    // Columnar extraction — O(N) single pass over the audit records.
+    let mut out_tiers         = Vec::with_capacity(n);
+    let mut out_flags         = Vec::with_capacity(n);
+    let mut out_zt_computed   = Vec::with_capacity(n);
+    let mut out_kappa_lattice = Vec::with_capacity(n);
+    let mut out_lorenz        = Vec::with_capacity(n);
+    let mut out_cc_error      = Vec::with_capacity(n);
+
+    for r in records {
+        out_tiers.push(r.tier);
+        out_flags.push(r.anomaly_flags);
+        out_zt_computed.push(r.zt_computed);
+        out_kappa_lattice.push(r.kappa_lattice);
+        out_lorenz.push(r.lorenz_number);
+        out_cc_error.push(r.cross_check_error);
+    }
+
+    // Materialise each column as a zero-copy PyArray and pack into a Python dict.
+    let dict = PyDict::new(py);
+    dict.set_item("tiers",             out_tiers.into_pyarray(py))?;
+    dict.set_item("anomaly_flags",     out_flags.into_pyarray(py))?;
+    dict.set_item("zT_computed",       out_zt_computed.into_pyarray(py))?;
+    dict.set_item("kappa_lattice",     out_kappa_lattice.into_pyarray(py))?;
+    dict.set_item("lorenz_number",     out_lorenz.into_pyarray(py))?;
+    dict.set_item("cross_check_error", out_cc_error.into_pyarray(py))?;
+
+    Ok(dict.into())
+}
+
+// ============================================================================
 // MODULE EXPORT REGISTRY
 // ============================================================================
 
@@ -531,11 +632,26 @@ fn rust_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_log_posterior_batch_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_material_rank_batch_py, m)?)?;
     m.add_function(wrap_pyfunction!(compute_information_gain_batch_py, m)?)?;
-    
+
+    // Triple-Gate Epistemic Audit (SPEC-AUDIT-01)
+    m.add_function(wrap_pyfunction!(audit_thermodynamics_py, m)?)?;
+
     // Register physics-layer constants representing absolute bounds
     m.add("L0_SOMMERFELD", physics::L0_SOMMERFELD)?;
     m.add("L_MIN", physics::L_MIN)?;
     m.add("L_MAX", physics::L_MAX)?;
+
+    // Expose ConfidenceTier ordinal values for symbolic use in Python consumers
+    m.add("TIER_A",      audit::ConfidenceTier::TierA  as u8)?;
+    m.add("TIER_B",      audit::ConfidenceTier::TierB  as u8)?;
+    m.add("TIER_C",      audit::ConfidenceTier::TierC  as u8)?;
+    m.add("TIER_REJECT", audit::ConfidenceTier::Reject as u8)?;
+
+    // Expose anomaly flag bitmasks for symbolic bitwise testing in Python consumers
+    m.add("FLAG_NEGATIVE_KAPPA_L",  audit::FLAG_NEGATIVE_KAPPA_L)?;
+    m.add("FLAG_LORENZ_OUT_BOUNDS", audit::FLAG_LORENZ_OUT_BOUNDS)?;
+    m.add("FLAG_ZT_MISMATCH",       audit::FLAG_ZT_MISMATCH)?;
+    m.add("FLAG_ALGEBRAIC_REJECT",  audit::FLAG_ALGEBRAIC_REJECT)?;
 
     Ok(())
 }

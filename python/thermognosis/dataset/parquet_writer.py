@@ -15,9 +15,9 @@ without exceeding hardware limits.
 import itertools
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -48,10 +48,18 @@ class ParquetWriteError(ThermognosisDatasetError):
 @dataclass(frozen=True, slots=True)
 class DataPointRecord:
     """
-    Immutable, high-performance structured record for a singular thermodynamic 
-    or electronic transport measurement. Using slots=True guarantees minimal 
-    memory footprint overhead, enabling streaming of millions of records.
+    Immutable, high-performance structured record for a singular thermodynamic
+    or electronic transport measurement, enriched with the Q1 audit trail.
+
+    Using ``slots=True`` guarantees minimal per-instance memory overhead,
+    enabling streaming of millions of records within the O(B) constraint.
+
+    # Audit Trail Fields (SPEC-AUDIT-01)
+    The six trailing optional fields are populated by the Triple-Gate physics
+    arbiter.  They default to ``None`` for records that pre-date the audit
+    pipeline, preserving backward compatibility with existing serialised data.
     """
+    # --- Core measurement fields (mandatory, no defaults) ---
     sample_id: int
     composition: str
     paper_id: int
@@ -62,21 +70,57 @@ class DataPointRecord:
     x: float
     y: float
 
+    # --- Q1 Audit Trail fields (nullable, must follow mandatory fields) ---
+    confidence_tier: Optional[int] = None
+    """Ordinal ConfidenceTier: 1=A, 2=B, 3=C, 4=Reject. Stored as int8."""
 
-# STRICT SCHEMA ENFORCEMENT:
-# Disallows silent coercion. PyArrow schema guarantees cross-language (Rust/C++/Python)
-# bitwise compatibility and columnar compression efficiency.
+    anomaly_flags: Optional[int] = None
+    """Bitmask of AnomalyFlags from SPEC-AUDIT-01 §4. Stored as uint32."""
+
+    zT_computed: Optional[float] = None
+    """Engine-computed figure of merit: zT = S²σT/κ. Stored as float64."""
+
+    kappa_lattice: Optional[float] = None
+    """Residual lattice thermal conductivity: κ − L₀σT. Stored as float64."""
+
+    lorenz_number: Optional[float] = None
+    """Effective Lorenz number: L = κ/(σT). Stored as float64."""
+
+    zT_cross_check_error: Optional[float] = None
+    """Relative deviation |zT_computed − zT_reported| / |zT_reported|. Stored as float64."""
+
+
+# STRICT SCHEMA ENFORCEMENT — Q1 AUDIT STANDARD
+# -----------------------------------------------
+# Disallows silent coercion. PyArrow schema guarantees cross-language
+# (Rust / C++ / Python / R) bitwise compatibility and optimal columnar
+# compression. All audit fields are nullable to accommodate both legacy
+# records and Gate-1 rejections where derived quantities are NaN.
 THERMOGNOSIS_SCHEMA = pa.schema([
-    pa.field("sample_id", pa.int32(), nullable=False),
-    pa.field("composition", pa.string(), nullable=False),
-    pa.field("paper_id", pa.int32(), nullable=False),
-    pa.field("property_x", pa.string(), nullable=False),
-    pa.field("property_y", pa.string(), nullable=False),
-    pa.field("unit_x", pa.string(), nullable=False),
-    pa.field("unit_y", pa.string(), nullable=False),
-    pa.field("x", pa.float64(), nullable=False),
-    pa.field("y", pa.float64(), nullable=False),
-], metadata={"system": "Thermognosis Engine", "version": "1.0.0", "status": "Normative"})
+    # --- Core measurement columns ---
+    pa.field("sample_id",   pa.int32(),   nullable=False),
+    pa.field("composition", pa.string(),  nullable=False),
+    pa.field("paper_id",    pa.int32(),   nullable=False),
+    pa.field("property_x",  pa.string(),  nullable=False),
+    pa.field("property_y",  pa.string(),  nullable=False),
+    pa.field("unit_x",      pa.string(),  nullable=False),
+    pa.field("unit_y",      pa.string(),  nullable=False),
+    pa.field("x",           pa.float64(), nullable=False),
+    pa.field("y",           pa.float64(), nullable=False),
+
+    # --- Q1 Audit Trail columns (SPEC-AUDIT-01) ---
+    pa.field("confidence_tier",      pa.int8(),    nullable=True),
+    pa.field("anomaly_flags",        pa.uint32(),  nullable=True),
+    pa.field("zT_computed",          pa.float64(), nullable=True),
+    pa.field("kappa_lattice",        pa.float64(), nullable=True),
+    pa.field("lorenz_number",        pa.float64(), nullable=True),
+    pa.field("zT_cross_check_error", pa.float64(), nullable=True),
+], metadata={
+    "system":  "Thermognosis Engine",
+    "version": "2.0.0",
+    "status":  "Normative — Q1 Dataset Standard",
+    "audit":   "Triple-Gate Epistemic Validation (SPEC-AUDIT-01)",
+})
 
 
 # =============================================================================
@@ -148,17 +192,45 @@ def write_parquet(records: Iterable[DataPointRecord], output_path: Path, batch_s
             
             for chunk_idx, batch in enumerate(_chunk_iterable(records, batch_size)):
                 try:
-                    # columnar transposition O(B) time
+                    # Columnar transposition O(B) time.
+                    # Audit trail columns are nullable — PyArrow maps Python
+                    # None to Arrow null and float NaN to float NaN natively.
                     arrays = [
-                        pa.array([r.sample_id for r in batch], type=pa.int32()),
-                        pa.array([r.composition for r in batch], type=pa.string()),
-                        pa.array([r.paper_id for r in batch], type=pa.int32()),
-                        pa.array([r.property_x for r in batch], type=pa.string()),
-                        pa.array([r.property_y for r in batch], type=pa.string()),
-                        pa.array([r.unit_x for r in batch], type=pa.string()),
-                        pa.array([r.unit_y for r in batch], type=pa.string()),
-                        pa.array([r.x for r in batch], type=pa.float64()),
-                        pa.array([r.y for r in batch], type=pa.float64()),
+                        # Core measurement columns
+                        pa.array([r.sample_id   for r in batch], type=pa.int32()),
+                        pa.array([r.composition  for r in batch], type=pa.string()),
+                        pa.array([r.paper_id    for r in batch], type=pa.int32()),
+                        pa.array([r.property_x  for r in batch], type=pa.string()),
+                        pa.array([r.property_y  for r in batch], type=pa.string()),
+                        pa.array([r.unit_x      for r in batch], type=pa.string()),
+                        pa.array([r.unit_y      for r in batch], type=pa.string()),
+                        pa.array([r.x           for r in batch], type=pa.float64()),
+                        pa.array([r.y           for r in batch], type=pa.float64()),
+                        # Q1 Audit Trail columns (SPEC-AUDIT-01) — nullable
+                        pa.array(
+                            [r.confidence_tier      for r in batch],
+                            type=pa.int8(),
+                        ),
+                        pa.array(
+                            [r.anomaly_flags        for r in batch],
+                            type=pa.uint32(),
+                        ),
+                        pa.array(
+                            [r.zT_computed          for r in batch],
+                            type=pa.float64(),
+                        ),
+                        pa.array(
+                            [r.kappa_lattice        for r in batch],
+                            type=pa.float64(),
+                        ),
+                        pa.array(
+                            [r.lorenz_number        for r in batch],
+                            type=pa.float64(),
+                        ),
+                        pa.array(
+                            [r.zT_cross_check_error for r in batch],
+                            type=pa.float64(),
+                        ),
                     ]
                     
                     table = pa.Table.from_arrays(arrays, schema=THERMOGNOSIS_SCHEMA)

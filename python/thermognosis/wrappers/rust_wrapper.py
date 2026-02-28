@@ -16,7 +16,7 @@ Implements:
 
 import logging
 from pathlib import Path
-from typing import Dict, Tuple, Union, Any, Optional
+from typing import Dict, Tuple, Union, Any, Optional, List
 
 import numpy as np
 
@@ -298,3 +298,95 @@ class RustCore:
             return base, reg, ent, cls_labels
         except (ValueError, RuntimeError) as e:
             raise RustCoreError(f"Quality evaluation failed: {e}") from e
+
+    def audit_thermodynamic_states(
+        self,
+        s: Union[float, np.ndarray],
+        sigma: Union[float, np.ndarray],
+        kappa: Union[float, np.ndarray],
+        t: Union[float, np.ndarray],
+        zt_reported: Optional[Union[float, np.ndarray]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Executes the Triple-Gate Epistemic Physics Audit over a thermodynamic dataset.
+
+        Assigns a ``ConfidenceTier`` (A, B, C, Reject) and an ``AnomalyFlags``
+        bitmask to every state by passing through three strictly ordered physical
+        gates without silent data dropping.
+
+        **Gate 1 — Algebraic Bounds**: Enforces T > 0, σ > 0, κ > 0 (finite).
+        **Gate 2 — Wiedemann–Franz Consistency**: Validates the Lorenz number
+          L = κ/(σT) ∈ [L_MIN, L_MAX] and the lattice residual κ_lattice ≥ 0.
+        **Gate 3 — zT Cross-Validation**: Flags |zT_computed − zT_reported| / |zT_reported| > 10%.
+
+        Document ID: SPEC-AUDIT-01
+
+        Parameters
+        ----------
+        s : array-like
+            Seebeck coefficient (V/K).
+        sigma : array-like
+            Electrical conductivity (S/m).
+        kappa : array-like
+            Total thermal conductivity (W m⁻¹ K⁻¹).
+        t : array-like
+            Absolute temperature (K).
+        zt_reported : array-like or None, optional
+            Externally reported dimensionless figure of merit (zT).
+            Pass ``None`` or omit to skip Gate 3 cross-validation (array filled with NaN).
+
+        Returns
+        -------
+        dict
+            A dictionary of six flat NumPy arrays (all length N), suitable for
+            direct ingestion into a Pandas DataFrame or Parquet writer:
+
+            - ``"tier"`` (uint8): Ordinal confidence tier.
+              ``1`` = TierA, ``2`` = TierB, ``3`` = TierC, ``4`` = Reject.
+            - ``"anomaly_flags"`` (uint32): Bitmask of detected anomaly flags.
+            - ``"zT_computed"`` (float64): Engine-computed figure of merit.
+            - ``"kappa_lattice"`` (float64): Residual lattice thermal conductivity.
+            - ``"lorenz_number"`` (float64): Effective Lorenz number L = κ/(σT).
+            - ``"zT_cross_check_error"`` (float64): Relative zT deviation (NaN where
+              no reliable reported value was available).
+
+        Raises
+        ------
+        RustCoreError
+            On dimension mismatch, FFI failure, or invalid input types.
+
+        Examples
+        --------
+        >>> rc = RustCore()
+        >>> audit = rc.audit_thermodynamic_states(s, sigma, kappa, T, zt_reported=ZT_lit)
+        >>> tier_a_mask = audit["tier"] == 1
+        >>> df = pd.DataFrame(audit)
+        """
+        s_arr     = self._prepare_f64_array(s,     "s")
+        sigma_arr = self._prepare_f64_array(sigma, "sigma")
+        kappa_arr = self._prepare_f64_array(kappa, "kappa")
+        t_arr     = self._prepare_f64_array(t,     "t")
+
+        # When no reported values are provided, Gate 3 is skipped via NaN sentinel.
+        if zt_reported is None:
+            zt_arr = np.full(s_arr.shape[0], np.nan, dtype=np.float64)
+        else:
+            zt_arr = self._prepare_f64_array(zt_reported, "zt_reported")
+
+        try:
+            raw: Dict[str, np.ndarray] = self._backend.audit_thermodynamics_py(
+                s_arr, sigma_arr, kappa_arr, t_arr, zt_arr,
+                self.deterministic,
+            )
+        except (ValueError, RuntimeError) as e:
+            raise RustCoreError(f"Triple-Gate physics audit failed: {e}") from e
+
+        # Remap keys to the canonical Q1 schema column names and return.
+        return {
+            "tier":                raw["tiers"],
+            "anomaly_flags":       raw["anomaly_flags"],
+            "zT_computed":         raw["zT_computed"],
+            "kappa_lattice":       raw["kappa_lattice"],
+            "lorenz_number":       raw["lorenz_number"],
+            "zT_cross_check_error": raw["cross_check_error"],
+        }
