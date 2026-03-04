@@ -45,7 +45,7 @@ data/raw/*
 
 data/processed/*
 data/
-doc/
+# doc/
 !data/.gitkeep
 
 thermognosis-engine/

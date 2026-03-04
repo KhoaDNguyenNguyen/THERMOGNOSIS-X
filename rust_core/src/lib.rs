@@ -42,6 +42,9 @@ pub mod information_gain;
 // Epistemic Quality Gate — Triple-Gate Physics Arbiter (SPEC-AUDIT-01)
 pub mod audit;
 
+// Parallel Mirror Directory Traversal Engine (SPEC-IO-WALKER-01)
+pub mod mirror_walker;
+
 // Export ThermoError centrally to satisfy crate-level internal references
 pub use bayesian::ThermoError;
 
@@ -635,6 +638,11 @@ fn rust_core(_py: Python, m: &PyModule) -> PyResult<()> {
 
     // Triple-Gate Epistemic Audit (SPEC-AUDIT-01)
     m.add_function(wrap_pyfunction!(audit_thermodynamics_py, m)?)?;
+
+    // Parallel Mirror Directory Walker (SPEC-IO-WALKER-01)
+    m.add_function(wrap_pyfunction!(mirror_walker::py_scan_domain, m)?)?;
+    m.add_function(wrap_pyfunction!(mirror_walker::py_enumerate_domain_paths, m)?)?;
+    m.add_function(wrap_pyfunction!(mirror_walker::py_validate_single_file, m)?)?;
 
     // Register physics-layer constants representing absolute bounds
     m.add("L0_SOMMERFELD", physics::L0_SOMMERFELD)?;
