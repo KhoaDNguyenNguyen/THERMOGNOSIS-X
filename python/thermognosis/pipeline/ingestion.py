@@ -20,43 +20,92 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-def classify_experiment_type(sample):
+
+warnings.warn(
+    "thermognosis.pipeline.ingestion is DEPRECATED. "
+    "Use rust_core.py_scan_domain() instead. "
+    "This Python module duplicates logic now owned by the Rust mirror walker "
+    "(SPEC-IO-WALKER-01) and will be removed in v1.0.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+
+def classify_experiment_type(sample: dict) -> str:
     """
-    Return:
-        'experimental'
-        'simulation'
-        'theory'
-        'unknown'
+    Classify the experiment type of a StarryData sample record.
+
+    BUG-04 Fix: The previous implementation concatenated ALL field values,
+    including the string literal "sample" which appears in every StarryData
+    record by design (the JSON key itself). This caused every record to match
+    the "sample" keyword and be classified as "experimental" regardless of
+    its actual nature, making the filter a no-op.
+
+    The corrected implementation examines only semantically meaningful fields
+    (method, calculationtype, technique, comment) using a priority-ordered
+    keyword scheme:
+
+      Priority 1 — Computational: explicit DFT/VASP/ab-initio keywords.
+      Priority 2 — Experimental: explicit synthesis/measurement keywords.
+      Priority 3 — Unknown: no unambiguous keyword found; treated as
+                   experimental with FLAG_LOW_CONFIDENCE_EXP set by caller.
+
+    Returns one of: 'experimental', 'computational', 'unknown'.
     """
+    # Examine only semantically relevant fields to avoid "sample" pollution.
+    relevant_fields = [
+        sample.get("method", ""),
+        sample.get("calculationtype", ""),
+        sample.get("technique", ""),
+        sample.get("comment", ""),
+        sample.get("instrument", ""),
+    ]
+    text = " ".join(str(f) for f in relevant_fields if f).lower()
 
-    # text = str(sample).lower()
-    text = " ".join(str(v) for v in sample.values()).lower()
+    # Priority 1: Computational — explicit DFT/simulation software keywords.
+    # These are unambiguous: no experimental paper uses these terms.
+    COMPUTATIONAL_KEYWORDS = {
+        "dft", "vasp", "wien2k", "quantum espresso", "openmx",
+        "ab initio", "first-principles", "first principles",
+        "calculated", "simulated", "molecular dynamics", "monte carlo",
+        "phonon calculation", "band structure calculation",
+    }
+    for kw in COMPUTATIONAL_KEYWORDS:
+        if kw in text:
+            return "computational"
 
-    if any(k in text for k in [
-        "measured",
-        "experiment",
-        "sample",
-        "synthesis",
-        "fabricated"
-    ]):
-        return "experimental"
+    # Priority 2: Experimental — explicit synthesis or characterisation keywords.
+    # "experiment" and "sample" are intentionally excluded (too broad/universal).
+    EXPERIMENTAL_KEYWORDS = {
+        "measured", "synthesized", "fabricated", "grown", "deposited",
+        "sintered", "pressed", "annealed", "spark plasma sintering",
+        "hot pressing", "arc melting", "zone melting", "ball milling",
+        "sputtered", "evaporated", "chemical vapor deposition", "cvd",
+        "four-probe", "harman method", "laser flash",
+    }
+    for kw in EXPERIMENTAL_KEYWORDS:
+        if kw in text:
+            return "experimental"
 
-    if any(k in text for k in [
-        "simulation",
-        "simulated",
-        "dft",
-        "calculated"
-    ]):
-        return "simulation"
-
-    if any(k in text for k in [
-        "model",
-        "theory",
-        "theoretical"
-    ]):
-        return "theory"
-
+    # Priority 3: No unambiguous keyword — return unknown.
+    # The caller is responsible for setting FLAG_LOW_CONFIDENCE_EXP and
+    # defaulting to experimental for downstream processing.
     return "unknown"
+
+
+def validate_measurement(*args, **kwargs):
+    """
+    Stub kept for import-compatibility only.
+
+    .. deprecated::
+        This function is superseded by rust_core.audit_thermodynamics_py().
+        Will raise RuntimeError on every call.
+    """
+    raise RuntimeError(
+        "DEPRECATED: validate_measurement() is superseded by "
+        "rust_core.audit_thermodynamics_py(). "
+        "This Python implementation will be removed in a future release."
+    )
 
 # -----------------------------------------------------------------------------
 # Global Conventions & System Constants
@@ -259,17 +308,22 @@ class MeasurementIngestor:
     def ingest_record(self, record: Dict[str, Any]) -> RawMeasurement:
         """
         Ingests a single raw measurement dictionary, applying all formal validation.
-        
+
         Parameters
         ----------
         record : Dict[str, Any]
             Raw dictionary containing 'mat_id', 'paper_id', physical quantities, and uncertainties.
-            
+
         Returns
         -------
         RawMeasurement
             An immutable, canonical measurement entity.
         """
+        raise RuntimeError(
+            "DEPRECATED: MeasurementIngestionPipeline.ingest_record() is superseded by "
+            "rust_core.py_scan_domain() for corpus-level ingestion. "
+            "This Python implementation will be removed in a future release."
+        )
         self._validate_mandatory_fields(record)
 
         q = MeasurementQuantities(
@@ -334,17 +388,22 @@ class MeasurementIngestor:
         """
         Ingests a tabular pandas DataFrame into a strictly validated list of RawMeasurement objects.
         Optimized for high-throughput batch ingestion while preserving entity guarantees.
-        
+
         Parameters
         ----------
         df : pd.DataFrame
             The dataframe containing batch experimental data.
-            
+
         Returns
         -------
         List[RawMeasurement]
             A list of instantiated, immutable measurement objects.
         """
+        raise RuntimeError(
+            "DEPRECATED: MeasurementIngestionPipeline.ingest_dataframe() is superseded by "
+            "rust_core.py_scan_domain() for corpus-level ingestion. "
+            "This Python implementation will be removed in a future release."
+        )
         if df.empty:
             logger.warning("Attempted to ingest an empty dataframe. Returning empty list.")
             return []

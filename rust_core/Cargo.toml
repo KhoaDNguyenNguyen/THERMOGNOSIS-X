@@ -12,31 +12,114 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # --- CORE FFI (Python <-> Rust) ---
-# Update lên 0.21 để hỗ trợ Python 3.12+ tốt nhất
-# 'abi3-py39' giúp binary tương thích từ Python 3.9 trở lên
 pyo3 = { version = "0.21", features = ["extension-module", "abi3-py39"] }
 numpy = "0.21"
 
 # --- MATH & DATA STRUCTURES ---
-# Thêm ndarray để hỗ trợ rust-numpy tốt hơn (dependency ngầm định)
-ndarray = "0.15" 
+ndarray = "0.15"
 
 # --- PARALLELISM & ERROR HANDLING ---
-rayon = "1.10"      # Update bản mới nhất để tối ưu thread pool
+rayon = "1.10"
 thiserror = "1.0"
 
 # --- SERIALIZATION & I/O ---
-# 'derive' cần thiết để mapping struct trực tiếp từ CSV/JSON
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 csv = "1.3"
 
-# --- PERFORMANCE ---
+# --- CONFIG LOADING (GAP-02: unit_registry.toml; GAP-01: memory_guard config) ---
+toml = { version = "0.8", features = ["parse"] }
+
+# --- CRYPTOGRAPHIC HASHING (GAP-04: dedup key = SHA256) ---
+sha2 = "0.10"
+hex = "0.4"
+
+# --- PROBABILISTIC DATA STRUCTURES (GAP-04: deduplication BloomFilter) ---
+bloomfilter = "1.0"
+
+# --- PERFORMANCE (GAP-07: O(1) AHashSet for property allowlist) ---
+# FIX: Previously placed inside [target.'cfg(target_os="macos")'.dependencies]
+# which made it Linux-invisible. Moved to unconditional [dependencies].
 ahash = "0.8"
 
+# --- LOGGING (MemoryGuard pressure notifications) ---
+log = "0.4"
+
+# --- PLATFORM-LEVEL MEMORY INFO (GAP-01: MemoryGuard) ---
+# Used on macOS only; Linux reads /proc/self/status directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# ============================================================================
+# CLIPPY LINTS (TASK 5b — pedantic mode, zero warnings policy)
+# ============================================================================
+[lints.clippy]
+all      = { level = "deny", priority = -2 }
+pedantic = { level = "deny", priority = -1 }
+# ============================================================================
+# GLOBAL LINT ALLOWLIST — each entry must be justified below.
+# Principle: allow only when the lint conflicts with domain conventions or
+# unavoidable API constraints. Correctness-affecting lints are never allowed.
+# ============================================================================
+
+# --- Cast / Numeric ---
+cast_precision_loss     = "allow"   # Welford/P² statistics: usize→f64 count conversion
+cast_lossless           = "allow"   # Explicit `as f64` casts preferred over From<> for clarity in physics
+cast_possible_truncation = "allow"  # Physics/stats: all f64→int casts are on domain-bounded values
+                                    # (temperatures 100–1200 K, indices bounded by clamping logic,
+                                    #  reservoir indices bounded by capacity). Truncation is intentional.
+cast_sign_loss          = "allow"   # All isize→usize casts follow explicit sign clamps (idx≥0 guaranteed)
+                                    # and f64→u64 casts follow hard/soft limit arithmetic (values > 0)
+cast_possible_wrap      = "allow"   # u32→i32 casts for exponent arithmetic in deterministic_round;
+                                    # precision is always ≤ 12, well within i32 positive range
+
+# --- Doc style ---
+missing_panics_doc      = "allow"   # const _: () = assert!(...) cannot panic at runtime
+missing_errors_doc      = "allow"   # Comprehensive # Errors sections pending full doc audit
+doc_markdown            = "allow"   # Math symbols (S², σ, κ, W·Ω·K⁻²) trigger false positives
+doc_comment_double_space_linebreaks = "allow"  # Math equations use explicit line breaks
+empty_line_after_doc_comments = "allow"  # Section headers in long doc-comments
+
+# --- Naming / Variables ---
+module_name_repetitions = "allow"   # WalkError::WalkError etc. are conventional in thiserror
+must_use_candidate      = "allow"   # Many pub functions are side-effect-free; callers may discard
+similar_names           = "allow"   # Physics: dz_ds/dz_dt/dz_dk are canonical partial derivative names
+many_single_char_names  = "allow"   # Physics: S, T, σ, κ, L are standard SI/IUPAC symbols
+
+# --- Function design ---
+too_many_lines          = "allow"   # Physics derivations require sequential step-by-step equations
+too_many_arguments      = "allow"   # Transport property functions must pass S, σ, κ, T simultaneously
+type_complexity         = "allow"   # Complex generics unavoidable in PyO3/numpy FFI return types
+needless_pass_by_value  = "allow"   # PyO3 macros require pass-by-value for certain argument types
+return_self_not_must_use = "allow"  # Builder-pattern fluent methods don't require #[must_use]
+
+# --- Inline / Performance ---
+inline_always           = "allow"   # #[inline(always)] on physics hot paths is intentional;
+                                    # each site has a performance justification comment
+
+# --- Code style ---
+manual_range_contains   = "allow"   # Explicit bounds (x < lo || x > hi) clearer in physics checks
+unreadable_literal      = "allow"   # Scientific notation (1e-3, 2.44e-8) preferred over 0.001
+explicit_iter_loop      = "allow"   # Explicit .iter() makes borrow semantics visible
+redundant_closure_for_method_calls = "allow"  # Closures improve readability in complex pipeline chains
+single_match_else       = "allow"   # Explicit match arms preferred over if-let in pattern-heavy code
+match_same_arms         = "allow"   # Explicit arms preferred for future-proofing
+used_underscore_binding = "allow"   # _py: Python in PyO3 function signatures
+uninlined_format_args   = "allow"   # Named format args preferred for error message readability
+manual_string_new       = "allow"   # String::new() explicit and idiomatic
+unwrap_or_default       = "allow"   # Explicit Default::default() calls preferred for clarity
+useless_format          = "allow"   # format!() used for error strings by established convention
+
 [profile.release]
-opt-level = 3       # Tối ưu tối đa tốc độ
-lto = "fat"         # Link Time Optimization: gom code để inline tốt hơn (thay vì true/thin)
-codegen-units = 1   # Giảm song song khi compile để code sinh ra nhanh hơn (dù build lâu hơn)
-panic = "abort"     # Giảm kích thước binary, không unwind stack khi lỗi (pyo3 sẽ bắt lỗi trước)
-strip = true        # Xóa debug symbols để file .so/.pyd nhẹ hơn
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+# Used in registry_tests in units.rs to write temporary TOML fixtures.
+tempfile = "3"
+
+[profile.test]
+opt-level = 1   # Faster test compilation; correctness is not affected by optimization level

@@ -332,3 +332,254 @@ pub const CELSIUS: UnitDefinition = UnitDefinition {
     k: 1.0,
     b: 273.15,
 };
+
+// ============================================================================
+// UNIT REGISTRY — TOML-backed runtime conversion table (GAP-02)
+// ============================================================================
+//
+// Loads `unit_registry.toml` at startup and provides O(1) lookup of SI
+// conversion factors by raw unit string. Failures to recognise a unit string
+// set FLAG_UNIT_UNKNOWN on the affected record.
+//
+// Design: the existing `UnitDefinition` / `PhysicalQuantity` layer provides
+// the algebraic framework. The `UnitRegistry` layer translates the corpus
+// unit strings (V/K, µV/K, S/cm, …) into (factor, offset) pairs without
+// requiring a full dimensional parse per record.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::io;
+use serde::Deserialize;
+use crate::flags::FLAG_UNIT_UNKNOWN;
+
+// ---- TOML deserialisation structs ----
+
+/// Top-level TOML document shape for `unit_registry.toml`.
+#[derive(Debug, Deserialize)]
+struct UnitRegistryToml {
+    #[serde(rename = "unit", default)]
+    units: Vec<UnitEntryToml>,
+}
+
+/// One `[[unit]]` entry in the TOML file.
+#[derive(Debug, Deserialize)]
+struct UnitEntryToml {
+    raw_string: String,
+    property: String,
+    #[allow(dead_code)]
+    si_unit: String,
+    factor: f64,
+    offset: f64,
+}
+
+// ---- Public API types ----
+
+/// Result of converting a raw value to SI.
+#[derive(Debug, Clone)]
+pub struct ConversionResult {
+    /// Value in SI units: `si_value = raw * factor + offset`.
+    pub si_value: f64,
+    /// Property category from the registry (e.g., "Seebeck").
+    pub property: String,
+    /// Anomaly flag bits: `FLAG_UNIT_UNKNOWN` if the unit string was not found.
+    pub flag_bits: u32,
+}
+
+/// Loaded unit conversion table indexed by raw unit string.
+///
+/// Constructed once at pipeline startup via [`UnitRegistry::from_toml`].
+/// All subsequent lookups are O(1) hash-map operations.
+#[derive(Debug, Clone)]
+pub struct UnitRegistry {
+    /// `raw_string → (factor, offset, property_name)`
+    table: HashMap<String, (f64, f64, String)>,
+}
+
+impl UnitRegistry {
+    /// Load the registry from a `unit_registry.toml` file.
+    ///
+    /// # Errors
+    /// Returns `io::Error` if the file cannot be read or if the TOML is malformed.
+    pub fn from_toml(path: &Path) -> io::Result<Self> {
+        let contents = std::fs::read_to_string(path)?;
+        let parsed: UnitRegistryToml = toml::from_str(&contents)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let mut table = HashMap::with_capacity(parsed.units.len());
+        for entry in parsed.units {
+            table.insert(entry.raw_string, (entry.factor, entry.offset, entry.property));
+        }
+        Ok(Self { table })
+    }
+
+    /// Convert a raw corpus value to SI.
+    ///
+    /// Formula: `si_value = raw_value * factor + offset`
+    ///
+    /// If `unit_string` is not present in the registry, returns the raw value
+    /// unchanged with `FLAG_UNIT_UNKNOWN` set in `flag_bits`.
+    #[must_use]
+    pub fn to_si(&self, raw_value: f64, unit_string: &str) -> ConversionResult {
+        match self.table.get(unit_string) {
+            Some((factor, offset, property)) => ConversionResult {
+                si_value: raw_value * factor + offset,
+                property: property.clone(),
+                flag_bits: 0,
+            },
+            None => ConversionResult {
+                si_value: raw_value,
+                property: String::new(),
+                flag_bits: FLAG_UNIT_UNKNOWN,
+            },
+        }
+    }
+
+    /// Check whether a unit string is known to the registry.
+    #[must_use]
+    pub fn is_known(&self, unit_string: &str) -> bool {
+        self.table.contains_key(unit_string)
+    }
+
+    /// Number of registered unit strings.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// True if the registry is empty (should never be the case for a valid load).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+}
+
+/// Check σ–ρ self-consistency.
+///
+/// When both electrical conductivity (σ, S/m) and electrical resistivity (ρ, Ω·m)
+/// are reported for the same measurement state, they must satisfy σ = 1/ρ within
+/// the given relative tolerance.
+///
+/// Returns the relative deviation |σ − 1/ρ| / (1/ρ). Returns `f64::NAN` if ρ = 0.
+///
+/// Sets `FLAG_SIGMA_RHO_INCON` (bit 3) if the deviation exceeds `rel_tol`.
+pub fn check_sigma_rho_consistency(sigma_s_per_m: f64, rho_ohm_m: f64, rel_tol: f64) -> (f64, u32) {
+    use crate::flags::FLAG_SIGMA_RHO_INCON;
+    if rho_ohm_m == 0.0 {
+        return (f64::NAN, FLAG_SIGMA_RHO_INCON);
+    }
+    let sigma_from_rho = 1.0 / rho_ohm_m;
+    let rel_dev = (sigma_s_per_m - sigma_from_rho).abs() / sigma_from_rho;
+    let flag = if rel_dev > rel_tol { FLAG_SIGMA_RHO_INCON } else { 0 };
+    (rel_dev, flag)
+}
+
+// ============================================================================
+// UNIT TESTS — UnitRegistry
+// ============================================================================
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::io::Write as IoWrite;
+
+    /// Write a minimal TOML snippet to a temp file and load it.
+    fn minimal_toml_registry() -> (tempfile::NamedTempFile, UnitRegistry) {
+        let mut f = tempfile::NamedTempFile::new().expect("tmpfile");
+        write!(
+            f,
+            r#"
+[[unit]]
+raw_string = "uV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-6
+offset = 0.0
+
+[[unit]]
+raw_string = "S/cm"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 100.0
+offset = 0.0
+
+[[unit]]
+raw_string = "degC"
+property = "Temperature"
+si_unit = "K"
+factor = 1.0
+offset = 273.15
+"#
+        )
+        .expect("write tmpfile");
+        f.flush().expect("flush");
+        let reg = UnitRegistry::from_toml(f.path()).expect("load registry");
+        (f, reg)
+    }
+
+    #[test]
+    fn registry_loads_unit_count() {
+        let (_f, reg) = minimal_toml_registry();
+        assert_eq!(reg.len(), 3, "Registry must contain 3 entries");
+    }
+
+    #[test]
+    fn to_si_known_unit_scaling() {
+        let (_f, reg) = minimal_toml_registry();
+        // 500 µV/K → 500e-6 V/K
+        let r = reg.to_si(500.0, "uV/K");
+        assert_eq!(r.flag_bits, 0, "Known unit must not set FLAG_UNIT_UNKNOWN");
+        assert!((r.si_value - 5.0e-4).abs() < 1.0e-15, "500 µV/K must convert to 5e-4 V/K");
+        assert_eq!(r.property, "Seebeck");
+    }
+
+    #[test]
+    fn to_si_known_unit_with_offset() {
+        let (_f, reg) = minimal_toml_registry();
+        // 27 °C → 300.15 K
+        let r = reg.to_si(27.0, "degC");
+        assert_eq!(r.flag_bits, 0);
+        assert!((r.si_value - 300.15).abs() < 1.0e-10, "27 °C must be 300.15 K");
+    }
+
+    #[test]
+    fn to_si_unknown_unit_sets_flag() {
+        let (_f, reg) = minimal_toml_registry();
+        let r = reg.to_si(42.0, "furlong/fortnight");
+        assert_ne!(
+            r.flag_bits & FLAG_UNIT_UNKNOWN,
+            0,
+            "Unknown unit must set FLAG_UNIT_UNKNOWN"
+        );
+        assert_eq!(r.si_value, 42.0, "Unknown unit: raw value must be returned unchanged");
+    }
+
+    #[test]
+    fn is_known_returns_correct_bool() {
+        let (_f, reg) = minimal_toml_registry();
+        assert!(reg.is_known("S/cm"));
+        assert!(!reg.is_known("S/mm"));
+    }
+
+    #[test]
+    fn sigma_rho_consistency_within_tolerance() {
+        // sigma = 1e5, rho = 1e-5 → exact inverse → deviation ≈ 0
+        let (dev, flag) = check_sigma_rho_consistency(1.0e5, 1.0e-5, 0.05);
+        assert!(dev < 1.0e-10, "Exact inverse: deviation must be near 0");
+        assert_eq!(flag, 0, "No flag for consistent sigma/rho");
+    }
+
+    #[test]
+    fn sigma_rho_consistency_exceeds_tolerance() {
+        use crate::flags::FLAG_SIGMA_RHO_INCON;
+        // sigma = 2e5, rho = 1e-5 → sigma_from_rho = 1e5 → 100% deviation
+        let (dev, flag) = check_sigma_rho_consistency(2.0e5, 1.0e-5, 0.05);
+        assert!(dev > 0.99, "50% sigma excess must produce large deviation");
+        assert_ne!(flag & FLAG_SIGMA_RHO_INCON, 0, "FLAG_SIGMA_RHO_INCON must be set");
+    }
+
+    #[test]
+    fn sigma_rho_consistency_zero_rho_returns_nan() {
+        let (dev, _flag) = check_sigma_rho_consistency(1.0e5, 0.0, 0.05);
+        assert!(dev.is_nan(), "Zero rho must return NaN deviation");
+    }
+}

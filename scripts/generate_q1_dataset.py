@@ -60,13 +60,10 @@ _SCRIPT_DIR  = Path(__file__).resolve().parent
 _PROJECT_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "python"))
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from thermognosis.wrappers.rust_wrapper import RustCore, RustCoreError
-from thermognosis.dataset.parquet_writer import (
-    DataPointRecord,
-    write_parquet,
-    ParquetWriteError,
-    SchemaValidationError,
-)
 
 # ---------------------------------------------------------------------------
 # Logging Setup
@@ -241,7 +238,7 @@ def _emit_audit_telemetry(
 def _build_records(df: pd.DataFrame, audit: Dict[str, np.ndarray]) -> list:
     """
     Fuse the raw DataFrame rows with their audit trail vectors to produce
-    a stream of ``DataPointRecord`` objects for the Parquet writer.
+    a stream of plain dicts for the pyarrow Parquet writer.
 
     This function operates in a single O(N) pass and emits records lazily
     to preserve the O(B) memory guarantee of the streaming writer.
@@ -274,24 +271,70 @@ def _build_records(df: pd.DataFrame, audit: Dict[str, np.ndarray]) -> list:
         def _f64_or_none(v: float) -> Optional[float]:
             return None if not np.isfinite(v) else float(v)
 
-        yield DataPointRecord(
-            sample_id   = int(getattr(row, "sample_id", i)),
-            composition = str(getattr(row, comp_col, "unknown")) if comp_col else "unknown",
-            paper_id    = int(getattr(row, pid_col,  0))          if pid_col  else 0,
-            property_x  = str(getattr(row, sx_col,  ""))          if sx_col   else "",
-            property_y  = str(getattr(row, sy_col,  ""))          if sy_col   else "",
-            unit_x      = str(getattr(row, ux_col,  ""))          if ux_col   else "",
-            unit_y      = str(getattr(row, uy_col,  ""))          if uy_col   else "",
-            x           = float(getattr(row, x_col, 0.0))         if x_col    else 0.0,
-            y           = float(getattr(row, y_col, 0.0))         if y_col    else 0.0,
+        yield {
+            "sample_id":           int(getattr(row, "sample_id", i)),
+            "composition":         str(getattr(row, comp_col, "unknown")) if comp_col else "unknown",
+            "paper_id":            int(getattr(row, pid_col,  0))          if pid_col  else 0,
+            "property_x":          str(getattr(row, sx_col,  ""))          if sx_col   else "",
+            "property_y":          str(getattr(row, sy_col,  ""))          if sy_col   else "",
+            "unit_x":              str(getattr(row, ux_col,  ""))          if ux_col   else "",
+            "unit_y":              str(getattr(row, uy_col,  ""))          if uy_col   else "",
+            "x":                   float(getattr(row, x_col, 0.0))         if x_col    else 0.0,
+            "y":                   float(getattr(row, y_col, 0.0))         if y_col    else 0.0,
             # Q1 Audit Trail
-            confidence_tier      = tier_val,
-            anomaly_flags        = flag_val,
-            zT_computed          = _f64_or_none(zt_c[i]),
-            kappa_lattice        = _f64_or_none(kl[i]),
-            lorenz_number        = _f64_or_none(lor[i]),
-            zT_cross_check_error = _f64_or_none(cce[i]),
-        )
+            "confidence_tier":      tier_val,
+            "anomaly_flags":        flag_val,
+            "zT_computed":          _f64_or_none(zt_c[i]),
+            "kappa_lattice":        _f64_or_none(kl[i]),
+            "lorenz_number":        _f64_or_none(lor[i]),
+            "zT_cross_check_error": _f64_or_none(cce[i]),
+        }
+
+
+def _write_parquet_from_dicts(
+    records,
+    output_path: Path,
+    batch_size: int = 50_000,
+) -> None:
+    """
+    Write an iterable of record dicts to a Parquet file using pyarrow.
+
+    Replaces the deleted thermognosis.dataset.parquet_writer.write_parquet().
+    Processes records in `batch_size` chunks to bound memory consumption.
+    Uses Snappy compression for compatibility with the Q1 dataset toolchain.
+    """
+    schema = pa.schema([
+        pa.field("sample_id",           pa.int64()),
+        pa.field("composition",          pa.string()),
+        pa.field("paper_id",             pa.int64()),
+        pa.field("property_x",           pa.string()),
+        pa.field("property_y",           pa.string()),
+        pa.field("unit_x",               pa.string()),
+        pa.field("unit_y",               pa.string()),
+        pa.field("x",                    pa.float64()),
+        pa.field("y",                    pa.float64()),
+        pa.field("confidence_tier",      pa.int32()),
+        pa.field("anomaly_flags",        pa.int32()),
+        pa.field("zT_computed",          pa.float64()),
+        pa.field("kappa_lattice",        pa.float64()),
+        pa.field("lorenz_number",        pa.float64()),
+        pa.field("zT_cross_check_error", pa.float64()),
+    ])
+
+    writer = pq.ParquetWriter(str(output_path), schema, compression="snappy")
+    batch: list = []
+    try:
+        for rec in records:
+            batch.append(rec)
+            if len(batch) >= batch_size:
+                tbl = pa.Table.from_pylist(batch, schema=schema)
+                writer.write_table(tbl)
+                batch.clear()
+        if batch:
+            tbl = pa.Table.from_pylist(batch, schema=schema)
+            writer.write_table(tbl)
+    finally:
+        writer.close()
 
 
 def main(args: argparse.Namespace) -> int:
@@ -407,12 +450,12 @@ def main(args: argparse.Namespace) -> int:
     )
 
     try:
-        write_parquet(
-            records    = _build_records(df, audit),
+        _write_parquet_from_dicts(
+            records     = _build_records(df, audit),
             output_path = output_path,
             batch_size  = args.batch_size,
         )
-    except (ParquetWriteError, SchemaValidationError) as exc:
+    except Exception as exc:
         logger.critical("Parquet serialisation failed: %s", exc)
         return 1
 

@@ -24,9 +24,10 @@ use pyo3::prelude::*;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::types::{PyDict, PyList};
 use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
-use rayon::prelude::*;
 
 // Internal module declarations mirroring the core library structure
+pub mod constants;   // Single source of truth for physical bounds (BUG-05)
+pub mod flags;       // Canonical anomaly flag bitmask set (GAP-03)
 pub mod csv_engine;
 pub mod error_propagation;
 pub mod physics;
@@ -44,6 +45,16 @@ pub mod audit;
 
 // Parallel Mirror Directory Traversal Engine (SPEC-IO-WALKER-01)
 pub mod mirror_walker;
+
+// ---- Session 2 Gap Implementations ----
+// GAP-01 / memory ceiling enforcement
+pub mod memory_guard;
+// GAP-03 / ZT cross-validation via PCHIP interpolation
+pub mod interpolation;
+// GAP-04 / BloomFilter deduplication
+pub mod dedup;
+// TASK 4 / Streaming statistics engine (Welford + P²)
+pub mod statistics;
 
 // Export ThermoError centrally to satisfy crate-level internal references
 pub use bayesian::ThermoError;
@@ -112,7 +123,7 @@ pub fn validate_dimensions_py<'py>(
     source_unit: &str,
     target_unit: &str,
     deterministic: bool,
-) -> PyResult<(&'py PyArray1<f64>, &'py PyArray1<f64>)> {
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
     let vals = extract_slice!(values, "values");
     let uncs = extract_slice!(uncertainties, "uncertainties");
     let len = enforce_equal_lengths(&[vals.len(), uncs.len()])?;
@@ -146,7 +157,7 @@ pub fn validate_dimensions_py<'py>(
         out_uncs.push(q.uncertainty);
     }
 
-    Ok((out_vals.into_pyarray(py), out_uncs.into_pyarray(py)))
+    Ok((out_vals.into_pyarray_bound(py), out_uncs.into_pyarray_bound(py)))
 }
 
 /// Validates thermodynamic constraints across state parameters.
@@ -164,7 +175,7 @@ pub fn check_physics_consistency_py<'py>(
     kappa: PyReadonlyArray1<'py, f64>,
     t: PyReadonlyArray1<'py, f64>,
     deterministic: bool,
-) -> PyResult<&'py PyArray1<f64>> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let s_slice = extract_slice!(s, "S");
     let sigma_slice = extract_slice!(sigma, "sigma");
     let kappa_slice = extract_slice!(kappa, "kappa");
@@ -199,7 +210,7 @@ pub fn check_physics_consistency_py<'py>(
     }).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let zt_out: Vec<f64> = validated.into_iter().map(|v| v.zt()).collect();
-    Ok(zt_out.into_pyarray(py))
+    Ok(zt_out.into_pyarray_bound(py))
 }
 
 /// Computes the first-order analytical propagation of standard measurement uncertainties for zT.
@@ -219,7 +230,7 @@ pub fn propagate_error_py<'py>(
     err_kappa: PyReadonlyArray1<'py, f64>,
     err_t: PyReadonlyArray1<'py, f64>,
     deterministic: bool,
-) -> PyResult<(&'py PyArray1<f64>, &'py PyArray1<f64>)> {
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
     let s_slice = extract_slice!(s, "S");
     let sigma_slice = extract_slice!(sigma, "sigma");
     let kappa_slice = extract_slice!(kappa, "kappa");
@@ -262,7 +273,7 @@ pub fn propagate_error_py<'py>(
         out_unc.push(r.uncertainty);
     }
 
-    Ok((out_zt.into_pyarray(py), out_unc.into_pyarray(py)))
+    Ok((out_zt.into_pyarray_bound(py), out_unc.into_pyarray_bound(py)))
 }
 
 /// Evaluates epistemological bounds, data credibility, and thermodynamic consistency 
@@ -283,7 +294,7 @@ pub fn compute_quality_score_py<'py>(
     hard_gate: PyReadonlyArray1<'py, bool>, 
     lambda_reg: f64,
     deterministic: bool,
-) -> PyResult<(&'py PyArray1<f64>, &'py PyArray1<f64>, &'py PyArray1<f64>, &'py PyArray1<u8>)> {
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<u8>>)> {
     let c_slice = extract_slice!(completeness, "completeness");
     let cr_slice = extract_slice!(credibility, "credibility");
     let ph_slice = extract_slice!(phys_consistency, "physics_consistency");
@@ -336,10 +347,10 @@ pub fn compute_quality_score_py<'py>(
     }
 
     Ok((
-        out_base.into_pyarray(py),
-        out_reg.into_pyarray(py),
-        out_ent.into_pyarray(py),
-        out_cls.into_pyarray(py),
+        out_base.into_pyarray_bound(py),
+        out_reg.into_pyarray_bound(py),
+        out_ent.into_pyarray_bound(py),
+        out_cls.into_pyarray_bound(py),
     ))
 }
 
@@ -353,7 +364,7 @@ pub fn py_compute_zt_batch<'py>(
     sigma: PyReadonlyArray1<'py, f64>,
     kappa: PyReadonlyArray1<'py, f64>,
     t: PyReadonlyArray1<'py, f64>,
-) -> PyResult<&'py PyArray1<f64>> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let s_slice = extract_slice!(s, "S");
     let sigma_slice = extract_slice!(sigma, "sigma");
     let kappa_slice = extract_slice!(kappa, "kappa");
@@ -371,7 +382,7 @@ pub fn py_compute_zt_batch<'py>(
         physics::calc_zt_batch(s_slice, sigma_slice, kappa_slice, t_slice)
     }).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    Ok(zt_out.into_pyarray(py))
+    Ok(zt_out.into_pyarray_bound(py))
 }
 
 /// Computes theoretical figure of merit (zT) directly from structured CSV streams.
@@ -387,7 +398,7 @@ pub fn compute_zt_from_csv_py(py: Python, path: String, deterministic: bool) -> 
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // 2. Initialize a bound, native Python Dictionary for zero-overhead transit.
-    let dict = PyDict::new(py);
+    let dict = PyDict::new_bound(py);
 
     // 3. Systematically map resultant scientific telemetry into the dynamically typed structure.
     dict.set_item("total_rows", report.total_rows)?;
@@ -424,7 +435,7 @@ pub fn compute_log_posterior_batch_py<'py>(
     sigma_zt: PyReadonlyArray1<'py, f64>,
     prior: PyReadonlyArray1<'py, f64>,
     lambda_wf: f64,
-) -> PyResult<(&'py PyArray1<f64>, &'py PyArray1<f64>)> {
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
     let s_slice = extract_slice!(s, "s");
     let sigma_slice = extract_slice!(sigma, "sigma");
     let kappa_slice = extract_slice!(kappa, "kappa");
@@ -442,7 +453,7 @@ pub fn compute_log_posterior_batch_py<'py>(
         )
     }).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    Ok((posterior_probs.into_pyarray(py), log_posteriors.into_pyarray(py)))
+    Ok((posterior_probs.into_pyarray_bound(py), log_posteriors.into_pyarray_bound(py)))
 }
 
 /// Computes the citation-aware, entropy-regularized material ranking manifold
@@ -459,7 +470,7 @@ pub fn compute_material_rank_batch_py<'py>(
     material_bounds: Vec<(usize, usize)>,
     alpha: f64,
     beta: f64,
-) -> PyResult<&'py PyArray1<f64>> {
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let p_slice = extract_slice!(p, "p");
     let zt_slice = extract_slice!(zt, "zt");
     let c_slice = extract_slice!(c, "c");
@@ -471,7 +482,7 @@ pub fn compute_material_rank_batch_py<'py>(
         )
     }).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    Ok(ranks.into_pyarray(py))
+    Ok(ranks.into_pyarray_bound(py))
 }
 
 /// Computes the Information Gain and Data Gap Analysis en masse.
@@ -489,7 +500,7 @@ pub fn compute_information_gain_batch_py<'py>(
     num_bins: usize,
     gamma_1: f64,
     gamma_2: f64,
-) -> PyResult<&'py PyList> {
+) -> PyResult<Bound<'py, PyList>> {
     let t_slice = extract_slice!(t, "t");
 
     let results = py.allow_threads(|| {
@@ -500,17 +511,17 @@ pub fn compute_information_gain_batch_py<'py>(
 
     // Pre-allocate the vector to sidestep reallocation costs
     let mut dicts = Vec::with_capacity(results.len());
-    
+
     // Transparently project the strict metrics back into dynamically typed Python bindings
     for res in results {
-        let dict = PyDict::new(py);
+        let dict = PyDict::new_bound(py);
         dict.set_item("entropy", res.entropy)?;
         dict.set_item("kl_divergence", res.kl_divergence)?;
         dict.set_item("total_score", res.total_score)?;
         dicts.push(dict);
     }
 
-    Ok(PyList::new(py, dicts))
+    Ok(PyList::new_bound(py, &dicts))
 }
 
 // ============================================================================
@@ -600,13 +611,13 @@ pub fn audit_thermodynamics_py<'py>(
     }
 
     // Materialise each column as a zero-copy PyArray and pack into a Python dict.
-    let dict = PyDict::new(py);
-    dict.set_item("tiers",             out_tiers.into_pyarray(py))?;
-    dict.set_item("anomaly_flags",     out_flags.into_pyarray(py))?;
-    dict.set_item("zT_computed",       out_zt_computed.into_pyarray(py))?;
-    dict.set_item("kappa_lattice",     out_kappa_lattice.into_pyarray(py))?;
-    dict.set_item("lorenz_number",     out_lorenz.into_pyarray(py))?;
-    dict.set_item("cross_check_error", out_cc_error.into_pyarray(py))?;
+    let dict = PyDict::new_bound(py);
+    dict.set_item("tiers",             out_tiers.into_pyarray_bound(py))?;
+    dict.set_item("anomaly_flags",     out_flags.into_pyarray_bound(py))?;
+    dict.set_item("zT_computed",       out_zt_computed.into_pyarray_bound(py))?;
+    dict.set_item("kappa_lattice",     out_kappa_lattice.into_pyarray_bound(py))?;
+    dict.set_item("lorenz_number",     out_lorenz.into_pyarray_bound(py))?;
+    dict.set_item("cross_check_error", out_cc_error.into_pyarray_bound(py))?;
 
     Ok(dict.into())
 }
@@ -620,7 +631,7 @@ pub fn audit_thermodynamics_py<'py>(
 /// Exposes natively compiled, mathematically constrained physical pipelines. 
 /// Guaranteed $\mathcal{O}(1)$ bridging overhead and zero implicit panics.
 #[pymodule]
-fn rust_core(_py: Python, m: &PyModule) -> PyResult<()> {
+fn rust_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register mathematical & governance bounding functions
     m.add_function(wrap_pyfunction!(py_compute_zt_batch, m)?)?;
     m.add_function(wrap_pyfunction!(validate_dimensions_py, m)?)?;
@@ -655,11 +666,44 @@ fn rust_core(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("TIER_C",      audit::ConfidenceTier::TierC  as u8)?;
     m.add("TIER_REJECT", audit::ConfidenceTier::Reject as u8)?;
 
-    // Expose anomaly flag bitmasks for symbolic bitwise testing in Python consumers
+    // ---- GAP-03: Canonical anomaly flag bitmasks (flags.rs) ----
+    // These are the authoritative names. All new Python code must use these.
+    m.add("FLAG_WF_VIOLATION",         flags::FLAG_WF_VIOLATION)?;
+    m.add("FLAG_ZT_CROSSCHECK_FAIL",   flags::FLAG_ZT_CROSSCHECK_FAIL)?;
+    m.add("FLAG_UNIT_UNKNOWN",         flags::FLAG_UNIT_UNKNOWN)?;
+    m.add("FLAG_SIGMA_RHO_INCON",      flags::FLAG_SIGMA_RHO_INCON)?;
+    m.add("FLAG_LOW_CONFIDENCE_EXP",   flags::FLAG_LOW_CONFIDENCE_EXP)?;
+    m.add("FLAG_INTERP_INSUFFICIENT",  flags::FLAG_INTERP_INSUFFICIENT)?;
+    m.add("FLAG_SEEBECK_BOUND_EXCEED", flags::FLAG_SEEBECK_BOUND_EXCEED)?;
+    m.add("FLAG_SIGMA_BOUND_EXCEED",   flags::FLAG_SIGMA_BOUND_EXCEED)?;
+    m.add("FLAG_KAPPA_BOUND_EXCEED",   flags::FLAG_KAPPA_BOUND_EXCEED)?;
+    m.add("FLAG_FIGUREID_MISMATCH",    flags::FLAG_FIGUREID_MISMATCH)?;
+    m.add("FLAG_DUPLICATE_SUSPECTED",  flags::FLAG_DUPLICATE_SUSPECTED)?;
+    m.add("FLAG_ALGEBRAIC_REJECT",     flags::FLAG_ALGEBRAIC_REJECT)?;
+
+    // ---- Legacy aliases (kept for backwards compatibility with existing scripts) ----
+    // These map to the same bit values as the canonical names above.
+    // Deprecated — update consuming scripts to use the FLAG_* names from flags.rs.
     m.add("FLAG_NEGATIVE_KAPPA_L",  audit::FLAG_NEGATIVE_KAPPA_L)?;
     m.add("FLAG_LORENZ_OUT_BOUNDS", audit::FLAG_LORENZ_OUT_BOUNDS)?;
     m.add("FLAG_ZT_MISMATCH",       audit::FLAG_ZT_MISMATCH)?;
-    m.add("FLAG_ALGEBRAIC_REJECT",  audit::FLAG_ALGEBRAIC_REJECT)?;
+
+    // ---- Physical constants exposed for Python validation scripts ----
+    m.add("SEEBECK_MAX_ABS_V_PER_K", constants::SEEBECK_MAX_ABS_V_PER_K)?;
+    m.add("SIGMA_MAX_S_PER_M",       constants::SIGMA_MAX_S_PER_M)?;
+    m.add("KAPPA_MAX_W_PER_MK",      constants::KAPPA_MAX_W_PER_MK)?;
+    m.add("T_MIN_K",                 constants::T_MIN_K)?;
+    m.add("T_MAX_K",                 constants::T_MAX_K)?;
+
+    // ---- flags.decode_flags: human-readable bitmask decoding for bad_records_report.jsonl ----
+    #[pyfunction]
+    fn py_decode_flags(flag_bits: u32) -> Vec<&'static str> {
+        flags::decode_flags(flag_bits)
+    }
+    m.add_function(wrap_pyfunction!(py_decode_flags, m)?)?;
+
+    // ---- ZT cross-check tolerance (Gate 3 threshold) ----
+    m.add("ZT_CROSSCHECK_TOLERANCE", interpolation::ZT_CROSSCHECK_TOLERANCE)?;
 
     Ok(())
 }

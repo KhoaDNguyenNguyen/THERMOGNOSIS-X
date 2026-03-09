@@ -1,52 +1,63 @@
 //! # P01 & P04 — Fundamental Thermoelectric Physics Core
-//! 
+//!
 //! **Layer:** Theory / Physics / Electronic Transport Consistency
 //! **Status:** Normative — Governing Physical Law
-//! **Dependencies:** SPEC-PHYS-CONSTRAINTS, P01-THERMOELECTRIC-EQUATIONS, P03-PHYSICAL-CONSTRAINTS, P04-WIEDEMANN-FRANZ-LIMIT
+//! **Dependencies:** SPEC-PHYS-CONSTRAINTS, P01-THERMOELECTRIC-EQUATIONS,
+//!                   P03-PHYSICAL-CONSTRAINTS, P04-WIEDEMANN-FRANZ-LIMIT
 //!
-//! This module formalizes the governing macroscopic transport equations and constitutive 
-//! relations for the Thermognosis Engine. It acts as an absolute enforcement barrier against 
-//! unphysical states, executing linear response theory and thermodynamic bounds.
+//! This module formalizes the governing macroscopic transport equations and
+//! constitutive relations for the Thermognosis Engine. It acts as an absolute
+//! enforcement barrier against unphysical states, executing linear response
+//! theory and thermodynamic bounds checks.
 //!
-//! All FFI invocations from Python to this core execute purely deterministic `f64` mathematics.
-//! No silent data mutation (e.g., clamping) is permitted, preserving the topological integrity 
-//! of the downstream Bayesian surrogate space.
+//! ## Constant Strategy (BUG-05 Fix)
+//! All empirical bounds are imported from `crate::constants` — the single
+//! source of truth for physical limits. Local re-exports with short names are
+//! provided for ergonomics within this module. `calc_zt_batch` previously used
+//! three distinct hardcoded literals that were inconsistent with the module-level
+//! constants; this has been corrected.
+//!
+//! No silent data mutation (clamping) is permitted. All values are strictly
+//! rejected via `Result::Err` or mapped to `f64::NAN` in batch paths.
 
 use rayon::prelude::*;
 use thiserror::Error;
 
-// ============================================================================
-// P04-WIEDEMANN-FRANZ-LIMIT: Transport Consistency Constants
-// ============================================================================
-
-/// Sommerfeld value for the Lorenz number under the free-electron Fermi-liquid approximation.
-/// Units: W Ω K^-2
-pub const L0_SOMMERFELD: f64 = 2.44e-8;
-
-/// Minimum permissible bound for the Lorenz number (L).
-pub const L_MIN: f64 = 1e-9;
-
-/// Maximum permissible bound for the Lorenz number (L).
-pub const L_MAX: f64 = 1e-7;
+use crate::constants::{
+    L0_SOMMERFELD as _L0, L_MIN as _L_MIN, L_MAX as _L_MAX,
+    SEEBECK_MAX_ABS_V_PER_K, SIGMA_MAX_S_PER_M, KAPPA_MAX_W_PER_MK,
+    T_MIN_K, T_MAX_K,
+};
 
 // ============================================================================
-// P03-PHYSICAL-CONSTRAINTS: Section 7 - Realistic Magnitude Constraints
+// Module-level re-exports of canonical constants (ergonomic aliases)
+// These names are part of the public API exported to Python via lib.rs.
 // ============================================================================
 
-/// Maximum physically realistic absolute Seebeck coefficient (|S|) in V/K. (1000 µV/K)
-pub const S_MAX_ABS: f64 = 1000e-6; 
+/// Sommerfeld value for the Lorenz number. Units: W·Ω·K⁻².
+pub const L0_SOMMERFELD: f64 = _L0;
 
-/// Maximum physically realistic electrical conductivity (sigma) in S/m.
-pub const SIGMA_MAX: f64 = 1e7;
+/// Minimum permissible Lorenz number bound (absolute lower limit).
+pub const L_MIN: f64 = _L_MIN;
 
-/// Maximum physically realistic total thermal conductivity (kappa) in W/(m·K).
-pub const KAPPA_MAX: f64 = 100.0;
+/// Maximum permissible Lorenz number bound (absolute upper limit).
+pub const L_MAX: f64 = _L_MAX;
 
-/// Minimum thermodynamic domain evaluation bound for Temperature (T) in K.
-pub const T_MIN: f64 = 100.0;
+/// Maximum physically realistic |S|. Alias for `SEEBECK_MAX_ABS_V_PER_K`.
+/// Kept for backwards compatibility with internal callers.
+pub const S_MAX_ABS: f64 = SEEBECK_MAX_ABS_V_PER_K;
 
-/// Maximum thermodynamic domain evaluation bound for Temperature (T) in K.
-pub const T_MAX: f64 = 2000.0;
+/// Maximum physically realistic σ. Alias for `SIGMA_MAX_S_PER_M`.
+pub const SIGMA_MAX: f64 = SIGMA_MAX_S_PER_M;
+
+/// Maximum physically realistic κ. Alias for `KAPPA_MAX_W_PER_MK`.
+pub const KAPPA_MAX: f64 = KAPPA_MAX_W_PER_MK;
+
+/// Minimum temperature for thermoelectric evaluation. Alias for `T_MIN_K`.
+pub const T_MIN: f64 = T_MIN_K;
+
+/// Maximum temperature for thermoelectric evaluation. Alias for `T_MAX_K`.
+pub const T_MAX: f64 = T_MAX_K;
 
 // ============================================================================
 // FORMAL ERROR HIERARCHY
@@ -221,6 +232,28 @@ pub fn wiedemann_franz_decomposition(
 /// **Implements:** SPEC-PHYS-CONSTRAINTS, P01-THERMOELECTRIC-EQUATIONS
 // Trong rust_core/src/physics.rs
 
+/// Highly optimized batch computation of Figure of Merit (zT) using parallel iterators.
+///
+/// Returns `f64::NAN` for any data point that fails a physical constraint rather than
+/// propagating an error, enabling branchless parallel evaluation of large arrays.
+///
+/// ## BUG-05 Fix
+/// The empirical bounds in this function previously used three independent hardcoded
+/// literals that were inconsistent with the module-level constants `S_MAX_ABS`,
+/// `SIGMA_MAX`, and `KAPPA_MAX`. Specifically:
+///   - `s_val.abs() > 0.05`    was 50 mV/K — 50× the correct limit of 1 mV/K.
+///   - `sigma_val > 1e8`       was 10× too permissive relative to `SIGMA_MAX = 1e7`.
+///   - `kappa_val > 5000.0`    was 50× too permissive relative to `KAPPA_MAX = 100.0`.
+///
+/// All three now use the canonical constants imported from `crate::constants`.
+///
+/// ## Physical Rejection Criteria (in order)
+/// 1. **P03 Positivity**: T > 0, κ > 0, σ > 0 (all must be finite).
+/// 2. **P04 Wiedemann-Franz**: L = κ/(σT) must lie in `[L_MIN, L_MAX]`.
+/// 3. **P03 Empirical Bounds**: |S| ≤ `S_MAX_ABS`, σ ≤ `SIGMA_MAX`, κ ≤ `KAPPA_MAX`.
+/// 4. **P01 ZT Positivity and Finiteness**: zT ∈ [0, 4].
+///
+/// **Implements:** SPEC-PHYS-CONSTRAINTS, P01-THERMOELECTRIC-EQUATIONS
 pub fn calc_zt_batch(
     s: &[f64],
     sigma: &[f64],
@@ -232,10 +265,6 @@ pub fn calc_zt_batch(
         return Err(PhysicsError::MismatchedArrayLengths);
     }
 
-    let l0_sommerfeld = 2.44e-8; // Số Lorenz chuẩn của kim loại
-    let l_min = 1e-9;            // Giới hạn dưới tuyệt đối cho bán dẫn (P04)
-
-    // Trả về mảng kết quả: Nếu vi phạm vật lý, trả về f64::NAN
     let results: Vec<f64> = s.par_iter()
         .zip(sigma)
         .zip(kappa)
@@ -246,25 +275,37 @@ pub fn calc_zt_batch(
             let kappa_val = *kapi;
             let t_val = *ti;
 
-            // 1. P03: Positivity Constraints
-            if t_val <= 0.0 || kappa_val <= 0.0 || sigma_val <= 0.0 {
+            // Stage 1 — P03 Positivity + Finiteness (hard thermodynamic invariants)
+            if !s_val.is_finite()
+                || !sigma_val.is_finite()
+                || !kappa_val.is_finite()
+                || !t_val.is_finite()
+                || t_val <= 0.0
+                || kappa_val <= 0.0
+                || sigma_val <= 0.0
+            {
                 return f64::NAN;
             }
 
-            // 2. P04: Wiedemann-Franz Limit (kappa_e = L * sigma * T)
+            // Stage 2 — P04 Wiedemann-Franz Limit: L = κ/(σT) ∈ [L_MIN, L_MAX]
             let implied_l = kappa_val / (sigma_val * t_val);
-            if implied_l < l_min {
+            if implied_l < L_MIN || implied_l > L_MAX {
                 return f64::NAN;
             }
 
-            // 3. Empirical bounds
-            if s_val.abs() > 0.05 || sigma_val > 1e8 || kappa_val > 5000.0 {
+            // Stage 3 — P03 Empirical Bounds (BUG-05 corrected to use canonical constants)
+            // |S| must not exceed 1000 µV/K = 1 mV/K = 1e-3 V/K (S_MAX_ABS).
+            // σ must not exceed 10^7 S/m (SIGMA_MAX).
+            // κ must not exceed 100 W/(m·K) (KAPPA_MAX).
+            if s_val.abs() > S_MAX_ABS || sigma_val > SIGMA_MAX || kappa_val > KAPPA_MAX {
                 return f64::NAN;
             }
 
-            // 4. Calculate ZT
+            // Stage 4 — P01 Evaluation: zT = S²σT/κ
             let zt = (s_val * s_val * sigma_val * t_val) / kappa_val;
 
+            // Stage 5 — P05 Resultant Positivity and physical upper bound
+            // zT ≤ 4 is a practical limit; no bulk material exceeds ~3.5 as of 2025.
             if !zt.is_finite() || zt < 0.0 || zt > 4.0 {
                 return f64::NAN;
             }
@@ -274,6 +315,86 @@ pub fn calc_zt_batch(
         .collect();
 
     Ok(results)
+}
+
+// ============================================================================
+// BUG-05 REGRESSION TESTS FOR calc_zt_batch
+// ============================================================================
+
+#[cfg(test)]
+mod calc_zt_batch_tests {
+    use super::*;
+
+    /// Canonical BiTe reference: S=200µV/K, σ=1e5 S/m, κ=1.5 W/(m·K), T=300 K.
+    fn canonical() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        (vec![200e-6], vec![1e5], vec![1.5], vec![300.0])
+    }
+
+    #[test]
+    fn canonical_state_produces_finite_zt() {
+        let (s, sig, kap, t) = canonical();
+        let r = calc_zt_batch(&s, &sig, &kap, &t).unwrap();
+        assert!(r[0].is_finite() && r[0] > 0.0, "Canonical state must yield finite positive zT");
+    }
+
+    /// BUG-05 regression: 50 mV/K was previously accepted by the wrong `0.05` literal.
+    /// It must now produce NAN because |S| = 0.05 V/K > S_MAX_ABS = 1e-3 V/K.
+    #[test]
+    fn bug05_seebeck_50mv_per_k_is_rejected() {
+        let s = vec![50.0e-3_f64]; // 50 mV/K — physically impossible for any thermoelectric
+        let sig = vec![1e5_f64];
+        let kap = vec![1.5_f64];
+        let t   = vec![300.0_f64];
+        let r = calc_zt_batch(&s, &sig, &kap, &t).unwrap();
+        assert!(
+            r[0].is_nan(),
+            "50 mV/K Seebeck must be rejected (NAN). BUG-05 regression. Got: {}",
+            r[0]
+        );
+    }
+
+    /// BUG-05 regression: sigma=1e8 S/m was previously accepted by the wrong `1e8` literal.
+    /// It must now produce NAN because σ = 1e8 > SIGMA_MAX = 1e7.
+    #[test]
+    fn bug05_sigma_1e8_is_rejected() {
+        let s   = vec![200e-6_f64];
+        let sig = vec![1e8_f64]; // 10× above SIGMA_MAX
+        let kap = vec![1.5_f64];
+        let t   = vec![300.0_f64];
+        let r = calc_zt_batch(&s, &sig, &kap, &t).unwrap();
+        assert!(r[0].is_nan(), "sigma=1e8 S/m must be rejected. BUG-05 regression.");
+    }
+
+    /// BUG-05 regression: kappa=5000 W/(m·K) was previously accepted by the wrong `5000.0` literal.
+    /// It must now produce NAN because κ = 5000 >> KAPPA_MAX = 100.
+    #[test]
+    fn bug05_kappa_5000_is_rejected() {
+        let s   = vec![200e-6_f64];
+        let sig = vec![1e5_f64];
+        let kap = vec![5000.0_f64]; // 50× above KAPPA_MAX
+        let t   = vec![300.0_f64];
+        let r = calc_zt_batch(&s, &sig, &kap, &t).unwrap();
+        assert!(r[0].is_nan(), "kappa=5000 W/(m·K) must be rejected. BUG-05 regression.");
+    }
+
+    #[test]
+    fn negative_temperature_is_rejected() {
+        let s   = vec![200e-6_f64];
+        let sig = vec![1e5_f64];
+        let kap = vec![1.5_f64];
+        let t   = vec![-50.0_f64];
+        let r = calc_zt_batch(&s, &sig, &kap, &t).unwrap();
+        assert!(r[0].is_nan());
+    }
+
+    #[test]
+    fn mismatched_lengths_return_error() {
+        let s   = vec![200e-6_f64; 5];
+        let sig = vec![1e5_f64; 4]; // wrong length
+        let kap = vec![1.5_f64; 5];
+        let t   = vec![300.0_f64; 5];
+        assert!(calc_zt_batch(&s, &sig, &kap, &t).is_err());
+    }
 }
 
 /// Highly optimized batch computation of the Wiedemann-Franz decomposition.

@@ -29,39 +29,29 @@
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::physics::{L0_SOMMERFELD, L_MIN, L_MAX};
+use crate::constants::{L0_SOMMERFELD, L_MIN, L_MAX, SEEBECK_MAX_ABS_V_PER_K, SIGMA_MAX_S_PER_M, KAPPA_MAX_W_PER_MK};
+use crate::flags::{
+    FLAG_WF_VIOLATION, FLAG_ZT_CROSSCHECK_FAIL,
+    FLAG_SEEBECK_BOUND_EXCEED, FLAG_SIGMA_BOUND_EXCEED, FLAG_KAPPA_BOUND_EXCEED,
+};
 
-// ============================================================================
-// SECTION 1: ANOMALY FLAG BITMASK CONSTANTS
-// SPEC-AUDIT-01 (Section 4: Bitmask Encoding)
-// ============================================================================
+// Re-export canonical flags under the legacy names used by existing Python consumers.
+// These aliases ensure that scripts checking `rust_core.FLAG_NEGATIVE_KAPPA_L` continue
+// to work after the transition to the unified flags.rs bitmask set.
+//
+// Note: The legacy 4-bit scheme (0b0001 … 0b1000) has been replaced by the
+// authoritative GAP-03 scheme. Python consumers must update to the new constants
+// exported from lib.rs; these re-exports will be removed in a future release.
+pub use crate::flags::FLAG_WF_VIOLATION as FLAG_NEGATIVE_KAPPA_L;
+pub use crate::flags::FLAG_ZT_CROSSCHECK_FAIL as FLAG_ZT_MISMATCH;
+// FIX: ERROR-01 — consolidated as a single pub use (no separate private use).
+// `pub use` makes FLAG_ALGEBRAIC_REJECT both available internally and re-exported.
+pub use crate::flags::FLAG_ALGEBRAIC_REJECT;
 
-/// Flags a non-positive lattice thermal conductivity (κ_lattice < 0).
-///
-/// This indicates the electronic contribution exceeds the total measured κ —
-/// a physical impossibility under the Wiedemann–Franz framework. Implies
-/// either unreliable σ data or a severely non-Fermi-liquid scattering regime.
-pub const FLAG_NEGATIVE_KAPPA_L: u32 = 0b0001;
-
-/// Flags a Lorenz number outside the admissible range [L_MIN, L_MAX].
-///
-/// The effective Lorenz number L = κ / (σT) deviating from the Sommerfeld
-/// window [1×10⁻⁹, 1×10⁻⁷] W·Ω·K⁻² suggests anomalous scattering mechanisms
-/// that violate the Wiedemann–Franz law — commonly bipolar diffusion or
-/// lattice-dominated conduction.
-pub const FLAG_LORENZ_OUT_BOUNDS: u32 = 0b0010;
-
-/// Flags a deviation > 10% between the computed zT and an externally reported zT.
-///
-/// Indicates a potential systematic transcription error, implicit unit mismatch,
-/// or unphysical post-processing artefact in the source publication.
-pub const FLAG_ZT_MISMATCH: u32 = 0b0100;
-
-/// Flags a fundamental algebraic constraint violation (T ≤ 0, σ ≤ 0, or κ ≤ 0).
-///
-/// The state is thermodynamically undefined. No derived quantity can be computed.
-/// Automatically promotes the record to `ConfidenceTier::Reject`.
-pub const FLAG_ALGEBRAIC_REJECT: u32 = 0b1000;
+/// Legacy alias — Lorenz-out-of-bounds is now merged into FLAG_WF_VIOLATION (bit 0).
+/// Both sub-violations of the Wiedemann-Franz consistency check share a single bit
+/// in the GAP-03 canonical flag scheme.
+pub const FLAG_LORENZ_OUT_BOUNDS: u32 = FLAG_WF_VIOLATION;
 
 // ============================================================================
 // SECTION 2: CONFIDENCE TIER ORDINAL ENUM
@@ -214,6 +204,50 @@ pub fn triple_check_physics(
     }
 
     // -------------------------------------------------------------------------
+    // GATE 1b: Empirical Bounds Check (P03-PHYSICAL-CONSTRAINTS §7)
+    // Checks |S|, σ, and κ against the canonical constants from constants.rs.
+    // Records violating these bounds receive a per-property flag (GAP-03) and
+    // are unconditionally rejected (Tier::Reject). This gate is positioned after
+    // the algebraic check because the bounds are meaningless on NaN/Inf values.
+    // -------------------------------------------------------------------------
+    if s.abs() > SEEBECK_MAX_ABS_V_PER_K {
+        flags |= FLAG_SEEBECK_BOUND_EXCEED;
+        flags |= FLAG_ALGEBRAIC_REJECT;
+        return PhysicsAuditRecord {
+            zt_computed: f64::NAN,
+            kappa_lattice: f64::NAN,
+            lorenz_number: f64::NAN,
+            cross_check_error: f64::NAN,
+            tier: ConfidenceTier::Reject as u8,
+            anomaly_flags: flags,
+        };
+    }
+    if sigma > SIGMA_MAX_S_PER_M {
+        flags |= FLAG_SIGMA_BOUND_EXCEED;
+        flags |= FLAG_ALGEBRAIC_REJECT;
+        return PhysicsAuditRecord {
+            zt_computed: f64::NAN,
+            kappa_lattice: f64::NAN,
+            lorenz_number: f64::NAN,
+            cross_check_error: f64::NAN,
+            tier: ConfidenceTier::Reject as u8,
+            anomaly_flags: flags,
+        };
+    }
+    if kappa > KAPPA_MAX_W_PER_MK {
+        flags |= FLAG_KAPPA_BOUND_EXCEED;
+        flags |= FLAG_ALGEBRAIC_REJECT;
+        return PhysicsAuditRecord {
+            zt_computed: f64::NAN,
+            kappa_lattice: f64::NAN,
+            lorenz_number: f64::NAN,
+            cross_check_error: f64::NAN,
+            tier: ConfidenceTier::Reject as u8,
+            anomaly_flags: flags,
+        };
+    }
+
+    // -------------------------------------------------------------------------
     // GATE 2: Transport Phenomenological Checks (Wiedemann–Franz Consistency)
     // Effective Lorenz number L = κ / (σT) — total ratio.
     // Sommerfeld lattice residual: κ_lattice = κ − L₀ σ T
@@ -223,7 +257,7 @@ pub fn triple_check_physics(
     let kappa_lattice = kappa - kappa_e;
 
     if lorenz_number < L_MIN || lorenz_number > L_MAX {
-        flags |= FLAG_LORENZ_OUT_BOUNDS;
+        flags |= FLAG_WF_VIOLATION;
         // Downgrade from TierA → TierB only if no more severe flag has been raised yet.
         if tier == ConfidenceTier::TierA {
             tier = ConfidenceTier::TierB;
@@ -231,7 +265,7 @@ pub fn triple_check_physics(
     }
 
     if kappa_lattice < 0.0 {
-        flags |= FLAG_NEGATIVE_KAPPA_L;
+        flags |= FLAG_WF_VIOLATION;
         // Hard downgrade to TierC: electronic conduction exceeds total κ.
         // This supersedes a TierB assignment.
         tier = ConfidenceTier::TierC;
@@ -240,14 +274,14 @@ pub fn triple_check_physics(
     // -------------------------------------------------------------------------
     // GATE 3: zT Cross-Validation (External Consistency Check)
     // zT = S² σ T / κ
-    // Deviation threshold: ε > 10% → FLAG_ZT_MISMATCH
+    // Deviation threshold: ε > 10% → FLAG_ZT_CROSSCHECK_FAIL
     // -------------------------------------------------------------------------
     let zt_computed = (s * s * sigma * t) / kappa;
 
     let cross_check_error = if zt_reported.is_finite() && zt_reported.abs() > f64::EPSILON {
         let rel_deviation = (zt_computed - zt_reported).abs() / zt_reported.abs();
         if rel_deviation > 0.10 {
-            flags |= FLAG_ZT_MISMATCH;
+            flags |= FLAG_ZT_CROSSCHECK_FAIL;
             // Hard downgrade to TierC regardless of prior Gate 2 result.
             tier = ConfidenceTier::TierC;
         }
@@ -382,26 +416,29 @@ mod tests {
     #[test]
     fn gate2_flags_negative_kappa_lattice() {
         // kappa_e = L0 * sigma * T = 2.44e-8 * 1e10 * 300 = 73.2 >> kappa
-        // Artificially make kappa < kappa_e
-        let sigma = 1e10_f64; // Very high sigma → kappa_e dominates
-        let kappa = 0.01;
+        // Artificially make kappa < kappa_e — this also makes sigma > SIGMA_MAX.
+        // Use a sigma at exactly SIGMA_MAX so the empirical bound does NOT reject,
+        // allowing us to test Gate 2's kappa_lattice check independently.
+        let sigma = 1e7_f64; // exactly SIGMA_MAX — passes empirical bound check
+        let kappa = 0.01;    // far below kappa_e = L0 * 1e7 * 300 ≈ 0.073
         let t = 300.0;
         let s = 10e-6;
         let rec = triple_check_physics(s, sigma, kappa, t, f64::NAN);
 
-        assert_ne!(rec.anomaly_flags & FLAG_NEGATIVE_KAPPA_L, 0);
+        assert_ne!(rec.anomaly_flags & FLAG_WF_VIOLATION, 0, "FLAG_WF_VIOLATION must be set");
         assert_eq!(rec.tier, ConfidenceTier::TierC as u8);
     }
 
     #[test]
-    fn gate3_flags_zt_mismatch_above_10pct() {
+    fn gate3_flags_zt_crosscheck_fail_above_10pct() {
         let (s, sigma, kappa, t) = canonical_state();
         let zt_computed = s * s * sigma * t / kappa;
-        // Inflate the reported value by 20%
-        let zt_reported = zt_computed * 1.20;
+        // Inflate reported ZT by 25% above computed.
+        // cross_check_error = |zt_c - zt_r| / zt_r = 0.25*zt / (1.25*zt) = 0.20 exactly.
+        let zt_reported = zt_computed * 1.25;
         let rec = triple_check_physics(s, sigma, kappa, t, zt_reported);
 
-        assert_ne!(rec.anomaly_flags & FLAG_ZT_MISMATCH, 0);
+        assert_ne!(rec.anomaly_flags & FLAG_ZT_CROSSCHECK_FAIL, 0);
         assert_eq!(rec.tier, ConfidenceTier::TierC as u8);
         assert!((rec.cross_check_error - 0.20).abs() < 1e-10);
     }
@@ -411,8 +448,34 @@ mod tests {
         let (s, sigma, kappa, t) = canonical_state();
         let rec = triple_check_physics(s, sigma, kappa, t, f64::NAN);
 
-        assert_eq!(rec.anomaly_flags & FLAG_ZT_MISMATCH, 0);
+        assert_eq!(rec.anomaly_flags & FLAG_ZT_CROSSCHECK_FAIL, 0);
         assert!(rec.cross_check_error.is_nan());
+    }
+
+    /// BUG-05 regression via audit path: 50 mV/K must be rejected as Tier::Reject
+    /// with FLAG_SEEBECK_BOUND_EXCEED set, not silently passed as Tier A.
+    #[test]
+    fn gate1b_rejects_seebeck_50mv_per_k() {
+        let s = 50.0e-3; // 50 mV/K — far above 1 mV/K limit
+        let rec = triple_check_physics(s, 1e5, 1.5, 300.0, f64::NAN);
+
+        assert_eq!(rec.tier, ConfidenceTier::Reject as u8);
+        assert_ne!(rec.anomaly_flags & FLAG_SEEBECK_BOUND_EXCEED, 0);
+        assert!(rec.zt_computed.is_nan());
+    }
+
+    #[test]
+    fn gate1b_rejects_sigma_above_max() {
+        let rec = triple_check_physics(200e-6, 2e7, 1.5, 300.0, f64::NAN);
+        assert_eq!(rec.tier, ConfidenceTier::Reject as u8);
+        assert_ne!(rec.anomaly_flags & FLAG_SIGMA_BOUND_EXCEED, 0);
+    }
+
+    #[test]
+    fn gate1b_rejects_kappa_above_max() {
+        let rec = triple_check_physics(200e-6, 1e5, 500.0, 300.0, f64::NAN);
+        assert_eq!(rec.tier, ConfidenceTier::Reject as u8);
+        assert_ne!(rec.anomaly_flags & FLAG_KAPPA_BOUND_EXCEED, 0);
     }
 
     #[test]

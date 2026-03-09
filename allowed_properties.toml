@@ -1,0 +1,194 @@
+# allowed_properties.toml
+#
+# THERMOGNOSIS-X — Canonical Thermoelectric Property Allowlist
+# ============================================================
+# Document ID : BUG-01 remediation, SPEC-IO-WALKER-01
+# Status      : Normative — Q1 Dataset Standard
+#
+# This file defines the exhaustive set of Starrydata property IDs
+# that are admitted as the y-axis (dependent variable) in the clean
+# thermoelectric dataset. Any measurement whose `propertyid_y` is not
+# listed here is REJECTED from the clean Parquet output.
+#
+# ENFORCEMENT: The Rust constant `ALLOWED_PROPERTY_IDS` in
+# `rust_core/src/mirror_walker.rs` must be kept in sync with this file.
+# Any extension requires updating BOTH the TOML (policy) and the Rust
+# array (enforcement).
+#
+# Physical basis for exclusions:
+#   - Optical properties (Absorbance, Reflectance, Transmittance):
+#     Not transport properties. Appear in UV-Vis characterisation of
+#     samples 00040076–00040078; included erroneously by previous pipeline.
+#   - Mechanical properties (Young's Modulus, Hardness):
+#     Not relevant to thermoelectric performance.
+#   - Temperature (propertyid=1) as y-axis: Excluded. Temperature is
+#     always the x-axis in thermoelectric characterisation. Its appearance
+#     as y-axis indicates a malformed or inverted figure.
+
+[metadata]
+version = "1.0.0"
+created = "2026-03-05"
+authors = ["THERMOGNOSIS Research Group"]
+description = "Canonical allowlist of thermoelectric transport property IDs for Starrydata corpus filtering"
+
+# ============================================================================
+# ALLOWED PROPERTIES
+# Each entry maps a Starrydata propertyid to its physical description and
+# the canonical SI unit expected AFTER conversion via unit_registry.toml.
+# ============================================================================
+
+[[property]]
+id = 2
+name = "Seebeck coefficient"
+symbol = "S"
+si_unit = "V/K"
+dimension = "M L^2 T^-3 I^-1 Theta^-1"
+physical_basis = "Peltier–Seebeck–Thomson thermoelectric effect"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = -1.0e-3
+bound_max_si = 1.0e-3
+
+[[property]]
+id = 3
+name = "Electrical conductivity"
+symbol = "sigma"
+si_unit = "S/m"
+dimension = "M^-1 L^-3 T^3 I^2"
+physical_basis = "Ohm's law — linear response of current to electric field"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 1.0e7
+
+[[property]]
+id = 4
+name = "Total thermal conductivity"
+symbol = "kappa"
+si_unit = "W/(m*K)"
+dimension = "M L T^-3 Theta^-1"
+physical_basis = "Fourier heat conduction law — total (electronic + lattice)"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 100.0
+
+[[property]]
+id = 5
+name = "Electrical resistivity"
+symbol = "rho"
+si_unit = "ohm*m"
+dimension = "M L^3 T^-3 I^-2"
+physical_basis = "Inverse of electrical conductivity: rho = 1/sigma"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 1.0e7
+
+[[property]]
+id = 6
+name = "Power factor"
+symbol = "PF"
+si_unit = "W/(m*K^2)"
+dimension = "M L T^-3 Theta^-2"
+physical_basis = "PF = S^2 * sigma — numerator of the thermoelectric figure of merit"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 1.0e-2
+
+[[property]]
+id = 10
+name = "Hall coefficient"
+symbol = "R_H"
+si_unit = "m^3/C"
+dimension = "L^3 T I^-1"
+physical_basis = "Hall effect — carrier type and density diagnostic"
+literature = "doi:10.1103/PhysRev.100.675"
+bound_min_si = -1.0e3
+bound_max_si = 1.0e3
+
+[[property]]
+id = 11
+name = "Carrier concentration"
+symbol = "n"
+si_unit = "m^-3"
+dimension = "L^-3"
+physical_basis = "Charge carrier density — linked to Seebeck via Pisarenko relation"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 1.0e18
+bound_max_si = 1.0e27
+
+[[property]]
+id = 12
+name = "Hall mobility"
+symbol = "mu_H"
+si_unit = "m^2/(V*s)"
+dimension = "M^-1 T^2 I"
+physical_basis = "mu_H = |R_H| * sigma — Hall-effect carrier mobility"
+literature = "doi:10.1103/PhysRev.100.675"
+bound_min_si = 0.0
+bound_max_si = 1.0
+
+[[property]]
+id = 14
+name = "Lattice thermal conductivity"
+symbol = "kappa_L"
+si_unit = "W/(m*K)"
+dimension = "M L T^-3 Theta^-1"
+physical_basis = "kappa_L = kappa - kappa_e = kappa - L*sigma*T (Wiedemann-Franz)"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 100.0
+
+[[property]]
+id = 15
+name = "Figure of merit Z"
+symbol = "Z"
+si_unit = "K^-1"
+dimension = "Theta^-1"
+physical_basis = "Z = S^2*sigma/kappa — temperature-independent figure of merit"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 1.0e-2
+
+[[property]]
+id = 16
+name = "Dimensionless figure of merit ZT"
+symbol = "ZT"
+si_unit = "1"
+dimension = "dimensionless"
+physical_basis = "ZT = S^2*sigma*T/kappa — canonical thermoelectric efficiency metric"
+literature = "doi:10.1038/nmat2090"
+bound_min_si = 0.0
+bound_max_si = 4.0
+
+# ============================================================================
+# EXPLICITLY EXCLUDED PROPERTY IDs
+# Listed here for documentation — these are the IDs that triggered BUG-01.
+# ============================================================================
+
+[[excluded_property]]
+id = 1
+name = "Temperature"
+reason = "Temperature is always the x-axis in thermoelectric characterisation. Its appearance as y-axis (propertyid_y=1) indicates a malformed or inverted figure."
+
+[[excluded_property]]
+id = 7
+name = "Thermal diffusivity"
+reason = "Not a direct transport property; used as intermediate in kappa = rho_mass * Cp * alpha. Not relevant for ZT calculation."
+
+[[excluded_property]]
+id = 8
+name = "Specific heat capacity"
+reason = "Not a direct transport property; used as intermediate. Admitted only when explicitly needed for kappa reconstruction."
+
+[[excluded_property]]
+id = 9
+name = "Mass density"
+reason = "Not an electronic transport property."
+
+[[excluded_property]]
+id = 17
+name = "Absorbance (UV-Vis)"
+reason = "Optical property. Not a thermoelectric transport property. Responsible for data contamination in samples 00040076, 00040077, 00040078."
+
+[[excluded_property]]
+id = 18
+name = "Reflectance"
+reason = "Optical property. Same exclusion rationale as Absorbance."

@@ -59,3 +59,11 @@ flatten.py
 /flattened_workspace
 crawl.log
 dataset/processed/
+starrydata_mirror/
+starrydata_mirror_temp/
+
+thermognosis.egg-info/
+scripts/__pycache__/
+output/
+figures/
+doc/

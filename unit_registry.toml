@@ -1,0 +1,362 @@
+# unit_registry.toml
+#
+# THERMOGNOSIS-X — SI Unit Conversion Registry (GAP-02)
+# ======================================================
+# Document ID : GAP-02, UNIT_converter_spec.md, UNIT_registry_spec.md
+# Status      : Normative — Q1 Dataset Standard
+#
+# This file maps every known unit string encountered in the Starrydata corpus
+# to its SI equivalent via a multiplicative factor and optional additive offset.
+#
+# Conversion formula (affine):   si_value = raw_value * factor + offset
+# For pure scaling:               si_value = raw_value * factor   (offset = 0.0)
+# For temperature offset (°C→K): si_value = raw_value * 1.0 + 273.15
+#
+# ENFORCEMENT: The Rust UnitConverter (GAP-02) loads this file at startup.
+# Any unit string NOT present here causes FLAG_UNIT_UNKNOWN to be set on the
+# affected record, which is then excluded from the clean Parquet output.
+#
+# Sources:
+#   - IUPAC Green Book, 3rd Edition (2007 / 2024 update)
+#   - Starrydata2 corpus unit survey (internal analysis, 2025)
+#   - Snyder & Toberer, Nature Materials 7, 105–114 (2008)
+
+[metadata]
+version = "1.0.0"
+created = "2026-03-05"
+authors = ["THERMOGNOSIS Research Group"]
+
+# ============================================================================
+# SEEBECK COEFFICIENT (propertyid = 2)
+# SI unit: V/K
+# ============================================================================
+
+[[unit]]
+raw_string = "V/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "mV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-3
+offset = 0.0
+
+[[unit]]
+raw_string = "uV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-6
+offset = 0.0
+
+[[unit]]
+raw_string = "µV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-6
+offset = 0.0
+note = "Unicode mu — identical factor to uV/K."
+
+[[unit]]
+raw_string = "μV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-6
+offset = 0.0
+note = "Alternative Unicode mu."
+
+[[unit]]
+raw_string = "V K-1"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0
+offset = 0.0
+
+[[unit]]
+raw_string = "muV/K"
+property = "Seebeck"
+si_unit = "V/K"
+factor = 1.0e-6
+offset = 0.0
+
+# ============================================================================
+# ELECTRICAL CONDUCTIVITY (propertyid = 3)
+# SI unit: S/m
+# ============================================================================
+
+[[unit]]
+raw_string = "S/m"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "S/cm"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 100.0
+offset = 0.0
+
+[[unit]]
+raw_string = "1/(ohm*m)"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 1.0
+offset = 0.0
+note = "Equivalent to S/m by definition."
+
+[[unit]]
+raw_string = "1/(ohm*cm)"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 100.0
+offset = 0.0
+
+[[unit]]
+raw_string = "(ohm*cm)^-1"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 100.0
+offset = 0.0
+
+[[unit]]
+raw_string = "(ohm*m)^-1"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 1.0
+offset = 0.0
+
+[[unit]]
+raw_string = "S cm-1"
+property = "ElectricalConductivity"
+si_unit = "S/m"
+factor = 100.0
+offset = 0.0
+
+# ============================================================================
+# ELECTRICAL RESISTIVITY (propertyid = 5)
+# SI unit: ohm*m
+# ============================================================================
+
+[[unit]]
+raw_string = "ohm*m"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "ohm*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-2
+offset = 0.0
+
+[[unit]]
+raw_string = "mohm*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-5
+offset = 0.0
+
+[[unit]]
+raw_string = "mΩ*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-5
+offset = 0.0
+
+[[unit]]
+raw_string = "uohm*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-8
+offset = 0.0
+
+[[unit]]
+raw_string = "µΩ*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-8
+offset = 0.0
+
+[[unit]]
+raw_string = "Ω*m"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0
+offset = 0.0
+
+[[unit]]
+raw_string = "Ω*cm"
+property = "ElectricalResistivity"
+si_unit = "ohm*m"
+factor = 1.0e-2
+offset = 0.0
+
+# ============================================================================
+# THERMAL CONDUCTIVITY (propertyid = 4, 14)
+# SI unit: W/(m*K)
+# ============================================================================
+
+[[unit]]
+raw_string = "W/(m*K)"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "W/mK"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 1.0
+offset = 0.0
+
+[[unit]]
+raw_string = "W m-1 K-1"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 1.0
+offset = 0.0
+
+[[unit]]
+raw_string = "mW/(m*K)"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 1.0e-3
+offset = 0.0
+
+[[unit]]
+raw_string = "mW/mK"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 1.0e-3
+offset = 0.0
+
+[[unit]]
+raw_string = "W/(cm*K)"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 100.0
+offset = 0.0
+
+[[unit]]
+raw_string = "W/cmK"
+property = "ThermalConductivity"
+si_unit = "W/(m*K)"
+factor = 100.0
+offset = 0.0
+
+# ============================================================================
+# TEMPERATURE (propertyid = 1 — x-axis only)
+# SI unit: K
+# ============================================================================
+
+[[unit]]
+raw_string = "K"
+property = "Temperature"
+si_unit = "K"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "degC"
+property = "Temperature"
+si_unit = "K"
+factor = 1.0
+offset = 273.15
+
+[[unit]]
+raw_string = "°C"
+property = "Temperature"
+si_unit = "K"
+factor = 1.0
+offset = 273.15
+
+[[unit]]
+raw_string = "C"
+property = "Temperature"
+si_unit = "K"
+factor = 1.0
+offset = 273.15
+note = "Ambiguous 'C' — assumed Celsius per Starrydata corpus convention."
+
+# ============================================================================
+# POWER FACTOR (propertyid = 6)
+# SI unit: W/(m*K^2)
+# ============================================================================
+
+[[unit]]
+raw_string = "W/(m*K^2)"
+property = "PowerFactor"
+si_unit = "W/(m*K^2)"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."
+
+[[unit]]
+raw_string = "mW/(m*K^2)"
+property = "PowerFactor"
+si_unit = "W/(m*K^2)"
+factor = 1.0e-3
+offset = 0.0
+
+[[unit]]
+raw_string = "uW/(m*K^2)"
+property = "PowerFactor"
+si_unit = "W/(m*K^2)"
+factor = 1.0e-6
+offset = 0.0
+
+[[unit]]
+raw_string = "µW/(cm*K^2)"
+property = "PowerFactor"
+si_unit = "W/(m*K^2)"
+factor = 1.0e-4
+offset = 0.0
+
+[[unit]]
+raw_string = "mW/(cm*K^2)"
+property = "PowerFactor"
+si_unit = "W/(m*K^2)"
+factor = 1.0e-1
+offset = 0.0
+
+# ============================================================================
+# FIGURE OF MERIT (propertyid = 15, 16)
+# ZT is dimensionless; Z has SI unit K^-1
+# ============================================================================
+
+[[unit]]
+raw_string = "1"
+property = "ZT"
+si_unit = "1"
+factor = 1.0
+offset = 0.0
+note = "Dimensionless ZT — no conversion needed."
+
+[[unit]]
+raw_string = ""
+property = "ZT"
+si_unit = "1"
+factor = 1.0
+offset = 0.0
+note = "Empty unit string in Starrydata — assume dimensionless for ZT records."
+
+[[unit]]
+raw_string = "K^-1"
+property = "ZFigureOfMerit"
+si_unit = "K^-1"
+factor = 1.0
+offset = 0.0
+note = "Already in SI."

@@ -47,13 +47,22 @@ if str(_PYTHON_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_PYTHON_SRC_DIR))
 
 try:
-    from thermognosis.dataset.json_parser import stream_samples, ThermognosisError
-    from thermognosis.dataset.parquet_writer import (
-        write_parquet, 
-        DataPointRecord as ParquetDataPointRecord
+    from thermognosis.dataset.json_parser import stream_samples, ThermognosisError  # type: ignore[import]
+    from thermognosis.dataset.parquet_writer import (  # type: ignore[import]
+        write_parquet,
+        DataPointRecord as ParquetDataPointRecord,
     )
-except ImportError as e:
-    print(f"FATAL: Thermognosis core libraries not found. Check PYTHONPATH. Error: {e}", file=sys.stderr)
+except ImportError:
+    # json_parser.py and parquet_writer.py have been deleted as part of the
+    # Rust-first migration (SPEC-IO-WALKER-01). This script is DEPRECATED.
+    # Replacement: scripts/build_starrydata_duckdb.py via rust_core.py_scan_domain()
+    print(
+        "DEPRECATED: normalize_starrydata.py relies on "
+        "thermognosis.dataset.json_parser and thermognosis.dataset.parquet_writer "
+        "which have been removed in the Rust-first migration.\n"
+        "Use scripts/build_starrydata_duckdb.py with rust_core.py_scan_domain() instead.",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 

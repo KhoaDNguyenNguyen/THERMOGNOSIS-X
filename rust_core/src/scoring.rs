@@ -10,6 +10,8 @@ use rayon::prelude::*;
 use std::f64;
 use thiserror::Error;
 
+use crate::memory_guard::{MemoryGuard, MemoryPressure};
+
 /// Formal Error Hierarchy for the Quality Scoring Module.
 /// Implements: SPEC-QUAL-SCORING Section 15 (Error Classification)
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -231,6 +233,30 @@ impl QualityEvaluator {
             .par_iter()
             .map(|vector| self.evaluate_record(vector))
             .collect()
+    }
+
+    /// Serial batch scoring with integrated MemoryGuard pressure checks.
+    ///
+    /// Preferred over `evaluate_batch` when the corpus is large enough to risk
+    /// exceeding the 6.5 GB hard ceiling. Returns partial results on hard pressure.
+    ///
+    /// # Errors
+    /// Returns `Err((partial_results, ScoringError))` if a scoring error occurs;
+    /// stops immediately on `MemoryPressure::Hard`.
+    pub fn evaluate_batch_guarded(
+        &self,
+        vectors: &[QualityVector],
+        guard: &mut MemoryGuard,
+    ) -> Result<Vec<ScoringResult>, ScoringError> {
+        let mut results = Vec::with_capacity(vectors.len());
+        for vector in vectors {
+            if guard.tick() == MemoryPressure::Hard {
+                // Partial results returned; caller must checkpoint and resume
+                break;
+            }
+            results.push(self.evaluate_record(vector)?);
+        }
+        Ok(results)
     }
 }
 

@@ -93,9 +93,8 @@ pub fn compute_zt_from_csv(path: &str, _deterministic: bool) -> Result<Benchmark
     while csv_reader.read_record(&mut record)? {
         report.total_rows += 1;
 
-        let t_raw = match extract_first_valid(&record, &t_cols) {
-            Some(v) => v,
-            None => continue, // Bỏ qua row không có nhiệt độ
+        let Some(t_raw) = extract_first_valid(&record, &t_cols) else {
+            continue; // Bỏ qua row không có nhiệt độ
         };
 
         let t_key = t_raw.round() as i64;

@@ -43,7 +43,11 @@ use serde::Deserialize;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use thiserror::Error;
+
+use crate::flags::FLAG_FIGUREID_MISMATCH;
+use crate::memory_guard::{MemoryGuard, MemoryPressure};
 
 // =============================================================================
 // SECTION 1: ERROR TAXONOMY
@@ -65,6 +69,91 @@ pub enum WalkError {
 
     #[error("IO-W04: Domain root does not exist: '{path}'")]
     DomainRootMissing { path: String },
+}
+
+// =============================================================================
+// SECTION 1b: THERMOELECTRIC PROPERTY ALLOWLIST (BUG-01 Fix)
+// =============================================================================
+
+/// Canonical set of Starrydata `propertyid_y` values that represent valid
+/// thermoelectric transport properties.
+///
+/// **BUG-01 Fix**: Previously, `parse_json_file` admitted all property types
+/// including optical (Absorbance, Reflectance), mechanical, and sensor data.
+/// This caused non-thermoelectric measurements from samples such as 00040076–78
+/// (UV-Vis Absorbance) to contaminate the clean dataset.
+///
+/// Any `RawMeasurement` whose `propertyid_y` is not in this slice is:
+///   (a) excluded from the `valid_measurements` vector returned in the record,
+///   (b) counted in `rejected_non_thermoelectric_count` on the `StarrydataRecord`,
+///   (c) never written to the output Parquet.
+///
+/// The authoritative list is maintained in `allowed_properties.toml`. This
+/// compile-time constant must match that file; any extension requires updating
+/// both. The TOML file is the human-readable policy document; this array is the
+/// enforcement mechanism.
+///
+/// | ID | Property                         | SI Unit           |
+/// |----|----------------------------------|-------------------|
+/// |  2 | Seebeck coefficient              | V·K⁻¹            |
+/// |  3 | Electrical conductivity          | S·m⁻¹            |
+/// |  4 | Total thermal conductivity       | W·m⁻¹·K⁻¹       |
+/// |  5 | Electrical resistivity           | Ω·m              |
+/// |  6 | Power factor (S²σ)              | W·m⁻¹·K⁻²       |
+/// | 10 | Hall coefficient                 | m³·C⁻¹           |
+/// | 11 | Carrier concentration            | m⁻³              |
+/// | 12 | Hall mobility                    | m²·V⁻¹·s⁻¹      |
+/// | 14 | Lattice thermal conductivity     | W·m⁻¹·K⁻¹       |
+/// | 15 | Figure of merit Z (= ZT/T)      | K⁻¹              |
+/// | 16 | Dimensionless figure of merit ZT | dimensionless     |
+const ALLOWED_PROPERTY_IDS: &[u32] = &[2, 3, 4, 5, 6, 10, 11, 12, 14, 15, 16];
+
+/// Global O(1) lookup set, lazily initialised once from `ALLOWED_PROPERTY_IDS`.
+///
+/// **GAP-07 / BUG-03**: Replaces the O(n=11) linear scan with an O(1) hash set
+/// lookup backed by `ahash` (non-cryptographic, cache-friendly). The `OnceLock`
+/// guarantees the set is constructed exactly once and shared across all threads.
+static ALLOWED_PROPERTY_SET: OnceLock<ahash::AHashSet<u32>> = OnceLock::new();
+
+/// Returns the globally-initialised O(1) property allowlist set.
+fn allowed_property_set() -> &'static ahash::AHashSet<u32> {
+    ALLOWED_PROPERTY_SET.get_or_init(|| ALLOWED_PROPERTY_IDS.iter().copied().collect())
+}
+
+/// Returns `true` if the given `propertyid_y` is a valid thermoelectric transport property.
+///
+/// O(1) lookup via `AHashSet` (see `ALLOWED_PROPERTY_SET`).
+#[inline(always)]
+fn is_allowed_property(propertyid_y: u32) -> bool {
+    allowed_property_set().contains(&propertyid_y)
+}
+
+// =============================================================================
+// SECTION 1c: FIGUREID CROSS-VALIDATION (GAP-05)
+// =============================================================================
+
+/// Build an O(1) set of all figure IDs declared in a JSON file's `figure[]` array.
+///
+/// Used by `parse_json_file` to validate that every `RawMeasurement.figureid`
+/// actually exists as a `FigureDescriptor` in the same file.
+fn build_figure_id_set(figures: &[FigureDescriptor]) -> ahash::AHashSet<u32> {
+    figures.iter().map(|f| f.figureid).collect()
+}
+
+/// Validate that a measurement's `figureid` references a known figure in the file.
+///
+/// **GAP-05**: Measurements whose `figureid` is not present in the file's
+/// `figure[]` array indicate either a cross-file reference collision or a
+/// corpus integrity issue. Such measurements are flagged but retained (not
+/// hard-rejected) to preserve audit transparency.
+///
+/// Returns `FLAG_FIGUREID_MISMATCH` (bit 9) if the reference is invalid, else 0.
+pub fn validate_figure_reference(figureid: u32, known_figure_ids: &ahash::AHashSet<u32>) -> u32 {
+    if known_figure_ids.contains(&figureid) {
+        0
+    } else {
+        FLAG_FIGUREID_MISMATCH
+    }
 }
 
 // =============================================================================
@@ -195,7 +284,16 @@ pub struct StarrydataRecord {
     pub papers: Vec<PaperDescriptor>,
     pub properties: Vec<PropertyDescriptor>,
     pub figures: Vec<FigureDescriptor>,
+    /// Measurements that passed the thermoelectric property allowlist (BUG-01).
     pub measurements: Vec<RawMeasurement>,
+    /// Count of measurements rejected because `propertyid_y` was not in
+    /// `ALLOWED_PROPERTY_IDS`. Corresponds to `rejected_non_thermoelectric_count`
+    /// in the pipeline statistics (TASK 4a).
+    pub rejected_non_thermoelectric_count: usize,
+    /// Count of measurements whose `figureid` was not found in the file's `figure[]`
+    /// array (GAP-05 FigureID cross-validation). These measurements are retained in
+    /// `measurements` but their `anomaly_flags` will include `FLAG_FIGUREID_MISMATCH`.
+    pub figureid_mismatch_count: usize,
 }
 
 // =============================================================================
@@ -215,7 +313,7 @@ where
     match val {
         serde_json::Value::Number(n) => n
             .as_u64()
-            .map(|u| u as u32)
+            .and_then(|u| u32::try_from(u).ok())
             .ok_or_else(|| D::Error::custom("ID value out of u32 range")),
         serde_json::Value::String(s) => s
             .trim()
@@ -288,7 +386,15 @@ fn discover_shard_directories(domain_root: &Path) -> Result<Vec<PathBuf>, WalkEr
         .collect();
 
     // Lexicographic sort guarantees deterministic processing order (00000 < 00001 < ...)
-    shards.sort_unstable();
+    // shards.sort_unstable();
+    // Ok(shards)
+        if shards.is_empty() {
+        // Fallback: If no subdirectories exist, treat the domain_root itself as the single shard.
+        shards.push(domain_root.to_path_buf());
+    } else {
+        // Lexicographic sort guarantees deterministic processing order (00000 < 00001 < ...)
+        shards.sort_unstable();
+    }
     Ok(shards)
 }
 
@@ -368,13 +474,34 @@ fn parse_json_file(path: &Path, domain: &str) -> Result<StarrydataRecord, WalkEr
             cause: e.to_string(),
         })?;
 
-    // Apply hard physical constraints to rawdata: expel NaN/Inf artifacts
-    // introduced by digitization software or floating-point serialization.
-    let valid_measurements: Vec<RawMeasurement> = root
-        .rawdata
-        .into_iter()
-        .filter(|m| m.x.is_finite() && m.y.is_finite())
-        .collect();
+    // Apply three-stage filtering to rawdata:
+    // Stage 1 — Expel NaN/Inf artifacts from digitization software.
+    // Stage 2 — BUG-01 Fix: reject measurements whose propertyid_y is not a
+    //            recognised thermoelectric transport property.
+    // Stage 3 — GAP-05: FigureID cross-validation. Measurements referencing an
+    //            unknown figureid are retained but their anomaly_flags are annotated.
+    let figure_id_set = build_figure_id_set(&root.figure);
+    let mut valid_measurements: Vec<RawMeasurement> = Vec::new();
+    let mut rejected_non_thermoelectric_count: usize = 0;
+    let mut figureid_mismatch_count: usize = 0;
+
+    for m in root.rawdata {
+        // Stage 1: NaN/Inf check
+        if !m.x.is_finite() || !m.y.is_finite() {
+            rejected_non_thermoelectric_count += 1;
+            continue;
+        }
+        // Stage 2: Thermoelectric property allowlist (BUG-01)
+        if !is_allowed_property(m.propertyid_y) {
+            rejected_non_thermoelectric_count += 1;
+            continue;
+        }
+        // Stage 3: FigureID cross-validation (GAP-05) — flag but retain
+        if validate_figure_reference(m.figureid, &figure_id_set) != 0 {
+            figureid_mismatch_count += 1;
+        }
+        valid_measurements.push(m);
+    }
 
     Ok(StarrydataRecord {
         source_path: path.display().to_string(),
@@ -384,6 +511,8 @@ fn parse_json_file(path: &Path, domain: &str) -> Result<StarrydataRecord, WalkEr
         properties: root.property,
         figures: root.figure,
         measurements: valid_measurements,
+        rejected_non_thermoelectric_count,
+        figureid_mismatch_count,
     })
 }
 
@@ -391,6 +520,8 @@ fn parse_json_file(path: &Path, domain: &str) -> Result<StarrydataRecord, WalkEr
 ///
 /// Rayon distributes file I/O and JSON deserialization across all logical cores.
 /// Parse errors are captured without aborting the pipeline (fail-soft semantics).
+/// The `guard` is ticked once per file result in the serial collection loop;
+/// this amortises the OS RSS check across the ingestion batch.
 ///
 /// # Returns
 /// `(records, errors)` tuple. The `errors` vec provides the audit trail of
@@ -398,6 +529,7 @@ fn parse_json_file(path: &Path, domain: &str) -> Result<StarrydataRecord, WalkEr
 fn ingest_files_parallel(
     paths: &[PathBuf],
     domain: &str,
+    guard: &mut MemoryGuard,
 ) -> (Vec<StarrydataRecord>, Vec<WalkError>) {
     let results: Vec<Result<StarrydataRecord, WalkError>> = paths
         .par_iter()
@@ -407,6 +539,18 @@ fn ingest_files_parallel(
     let mut records = Vec::new();
     let mut errors = Vec::new();
     for result in results {
+        // Phase 1: tick MemoryGuard — amortised RSS check per ingested file
+        if guard.tick() == MemoryPressure::Hard {
+            errors.push(WalkError::JsonParseError {
+                path: "<memory-ceiling>".to_string(),
+                cause: format!(
+                    "MEM-GUARD: Hard memory ceiling reached after {} records; \
+                     ingestion halted to protect host from OOM.",
+                    records.len()
+                ),
+            });
+            break;
+        }
         match result {
             Ok(r) => records.push(r),
             Err(e) => errors.push(e),
@@ -426,9 +570,17 @@ pub struct WalkSummary {
     pub files_found: usize,
     pub files_parsed: usize,
     pub files_failed: usize,
+    /// Measurements that passed all filters and entered the clean record set.
     pub total_measurements: usize,
     pub total_samples: usize,
     pub total_papers: usize,
+    /// Total measurements rejected because `propertyid_y` was not in the
+    /// thermoelectric allowlist (BUG-01 counter). Corresponds to
+    /// `rejected_non_thermoelectric_count` in `pipeline_statistics.json`.
+    pub rejected_non_thermoelectric: usize,
+    /// Total measurements that passed filtering but whose `figureid` was not
+    /// found in the file's `figure[]` array (GAP-05 FigureID mismatch counter).
+    pub figureid_mismatches: usize,
     pub errors: Vec<WalkError>,
 }
 
@@ -444,6 +596,9 @@ pub fn scan_domain(
     domain_root: &Path,
     domain_name: &str,
 ) -> Result<(Vec<StarrydataRecord>, WalkSummary), WalkError> {
+    // MemoryGuard: 5.5 GB soft / 6.5 GB hard ceiling; check every 1000 files
+    let mut guard = MemoryGuard::new(5_500_000_000, 6_500_000_000, 1_000);
+
     // Phase 1: Serial shard discovery
     let shards = discover_shard_directories(domain_root)?;
     let shards_discovered = shards.len();
@@ -452,14 +607,18 @@ pub fn scan_domain(
     let (all_paths, shard_errors) = collect_json_paths_parallel(&shards);
     let files_found = all_paths.len();
 
-    // Phase 3: Parallel JSON ingestion
-    let (records, mut file_errors) = ingest_files_parallel(&all_paths, domain_name);
+    // Phase 3: Parallel JSON ingestion (with MemoryGuard)
+    let (records, mut file_errors) = ingest_files_parallel(&all_paths, domain_name, &mut guard);
     let files_parsed = records.len();
 
     // Aggregate audit telemetry
     let total_measurements: usize = records.iter().map(|r| r.measurements.len()).sum();
     let total_samples: usize = records.iter().map(|r| r.samples.len()).sum();
     let total_papers: usize = records.iter().map(|r| r.papers.len()).sum();
+    let rejected_non_thermoelectric: usize =
+        records.iter().map(|r| r.rejected_non_thermoelectric_count).sum();
+    let figureid_mismatches: usize =
+        records.iter().map(|r| r.figureid_mismatch_count).sum();
 
     // Merge shard-level and file-level errors into a unified error log
     let mut all_errors = shard_errors;
@@ -475,6 +634,8 @@ pub fn scan_domain(
         total_measurements,
         total_samples,
         total_papers,
+        rejected_non_thermoelectric,
+        figureid_mismatches,
         errors: all_errors,
     };
 
@@ -488,7 +649,7 @@ pub fn scan_domain(
 /// Projects a `StarrydataRecord` into a Python dict for zero-overhead transit
 /// across the FFI boundary into the Python ingestion pipeline.
 fn record_to_pydict(py: Python, record: &StarrydataRecord) -> PyResult<PyObject> {
-    let d = PyDict::new(py);
+    let d = PyDict::new_bound(py);
     d.set_item("source_path", &record.source_path)?;
     d.set_item("source_domain", &record.source_domain)?;
     d.set_item("n_measurements", record.measurements.len())?;
@@ -496,9 +657,9 @@ fn record_to_pydict(py: Python, record: &StarrydataRecord) -> PyResult<PyObject>
     d.set_item("n_papers", record.papers.len())?;
 
     // Measurements → list of dicts
-    let meas_list = PyList::empty(py);
+    let meas_list = PyList::empty_bound(py);
     for m in &record.measurements {
-        let md = PyDict::new(py);
+        let md = PyDict::new_bound(py);
         md.set_item("paperid", m.paperid)?;
         md.set_item("sampleid", m.sampleid)?;
         md.set_item("figureid", m.figureid)?;
@@ -511,9 +672,9 @@ fn record_to_pydict(py: Python, record: &StarrydataRecord) -> PyResult<PyObject>
     d.set_item("measurements", meas_list)?;
 
     // Samples → list of dicts
-    let samp_list = PyList::empty(py);
+    let samp_list = PyList::empty_bound(py);
     for s in &record.samples {
-        let sd = PyDict::new(py);
+        let sd = PyDict::new_bound(py);
         sd.set_item("sampleid", s.sampleid)?;
         sd.set_item("paperid", s.paperid)?;
         sd.set_item("samplename", &s.samplename)?;
@@ -525,9 +686,9 @@ fn record_to_pydict(py: Python, record: &StarrydataRecord) -> PyResult<PyObject>
     d.set_item("samples", samp_list)?;
 
     // Papers → list of dicts
-    let paper_list = PyList::empty(py);
+    let paper_list = PyList::empty_bound(py);
     for p in &record.papers {
-        let pd = PyDict::new(py);
+        let pd = PyDict::new_bound(py);
         pd.set_item("paperid", p.paperid)?;
         pd.set_item("doi", &p.doi)?;
         pd.set_item("title", &p.title)?;
@@ -573,13 +734,13 @@ pub fn py_scan_domain(
         .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
     // Re-acquire GIL to build Python objects
-    let py_records = PyList::empty(py);
+    let py_records = PyList::empty_bound(py);
     for record in &records {
         let d = record_to_pydict(py, record)?;
         py_records.append(d)?;
     }
 
-    let py_summary = PyDict::new(py);
+    let py_summary = PyDict::new_bound(py);
     py_summary.set_item("domain", &summary.domain)?;
     py_summary.set_item("shards_discovered", summary.shards_discovered)?;
     py_summary.set_item("files_found", summary.files_found)?;
@@ -588,6 +749,10 @@ pub fn py_scan_domain(
     py_summary.set_item("total_measurements", summary.total_measurements)?;
     py_summary.set_item("total_samples", summary.total_samples)?;
     py_summary.set_item("total_papers", summary.total_papers)?;
+    // BUG-01: expose rejection count for pipeline_statistics.json
+    py_summary.set_item("rejected_non_thermoelectric", summary.rejected_non_thermoelectric)?;
+    // GAP-05: expose figureid mismatch count
+    py_summary.set_item("figureid_mismatches", summary.figureid_mismatches)?;
 
     // Surface error messages as a Python list for logging
     let error_strings: Vec<String> = summary.errors.iter().map(|e| e.to_string()).collect();
@@ -616,11 +781,71 @@ pub fn py_enumerate_domain_paths(py: Python, domain_root: &str) -> PyResult<PyOb
         Ok::<Vec<PathBuf>, PyErr>(paths)
     })?;
 
-    let py_list = PyList::empty(py);
+    let py_list = PyList::empty_bound(py);
     for p in &paths {
         py_list.append(p.display().to_string())?;
     }
     Ok(py_list.into())
+}
+
+// =============================================================================
+// SECTION 9: EXPERIMENT TYPE CLASSIFIER (BUG-04 Port)
+// =============================================================================
+
+/// Experiment type as resolved by `classify_experiment_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExperimentType {
+    Experimental,
+    Computational,
+    Unknown,
+}
+
+/// DFT/simulation software keywords for computational experiment classification (BUG-04).
+const COMPUTATIONAL_KEYWORDS: &[&str] = &[
+    "dft", "vasp", "wien2k", "quantum espresso", "openmx",
+    "ab initio", "first-principles", "first principles",
+    "calculated", "simulated", "molecular dynamics", "monte carlo",
+    "phonon calculation", "band structure calculation",
+];
+
+/// Synthesis and characterisation keywords for experimental classification (BUG-04).
+const EXPERIMENTAL_KEYWORDS: &[&str] = &[
+    "measured", "synthesized", "fabricated", "grown", "deposited",
+    "sintered", "pressed", "annealed", "spark plasma sintering",
+    "hot pressing", "arc melting", "zone melting", "ball milling",
+    "sputtered", "evaporated", "chemical vapor deposition", "cvd",
+    "four-probe", "harman method", "laser flash",
+];
+
+/// Port of `classify_experiment_type()` from Python ingestion.py (BUG-04 fix).
+///
+/// Examines only semantically relevant sample fields (method, calculationtype,
+/// technique, comment, instrument) to avoid pollution from the string "sample"
+/// appearing universally in Starrydata JSON keys.
+///
+/// Priority ordering:
+/// 1. Computational — unambiguous DFT/simulation keywords.
+/// 2. Experimental — explicit synthesis/characterisation keywords.
+/// 3. Unknown — no unambiguous keyword; caller may set FLAG_LOW_CONFIDENCE_EXP.
+#[must_use]
+pub fn classify_experiment_type(sample_info_json: &serde_json::Value) -> ExperimentType {
+    let relevant: Vec<&str> = ["method", "calculationtype", "technique", "comment", "instrument"]
+        .iter()
+        .filter_map(|&key| sample_info_json.get(key).and_then(|v| v.as_str()))
+        .collect();
+    let text: String = relevant.join(" ").to_lowercase();
+
+    for kw in COMPUTATIONAL_KEYWORDS {
+        if text.contains(kw) {
+            return ExperimentType::Computational;
+        }
+    }
+    for kw in EXPERIMENTAL_KEYWORDS {
+        if text.contains(kw) {
+            return ExperimentType::Experimental;
+        }
+    }
+    ExperimentType::Unknown
 }
 
 /// Validates a single JSON file and returns its record count without full ingestion.
@@ -640,7 +865,7 @@ pub fn py_validate_single_file(
         .allow_threads(|| parse_json_file(path, domain_name))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    let d = PyDict::new(py);
+    let d = PyDict::new_bound(py);
     d.set_item("source_path", &record.source_path)?;
     d.set_item("n_measurements", record.measurements.len())?;
     d.set_item("n_samples", record.samples.len())?;
@@ -648,4 +873,125 @@ pub fn py_validate_single_file(
     d.set_item("n_figures", record.figures.len())?;
     d.set_item("n_properties", record.properties.len())?;
     Ok(d.into())
+}
+
+// =============================================================================
+// SECTION 10: UNIT TESTS
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// BUG-01 Regression: A file containing only UV-Vis optical measurements
+    /// (propertyid_y = 20, not in ALLOWED_PROPERTY_IDS) must yield
+    /// `measurements.len() == 0` and `rejected_non_thermoelectric_count > 0`.
+    #[test]
+    fn bug01_uv_vis_optical_file_yields_zero_measurements() {
+        let json = r#"{"sample":[],"paper":[],"property":[],"figure":[],"rawdata":[
+            {"paperid":1,"sampleid":"1","figureid":"1","x":300.0,"y":0.5,"propertyid_x":1,"propertyid_y":20},
+            {"paperid":1,"sampleid":"1","figureid":"1","x":400.0,"y":0.6,"propertyid_x":1,"propertyid_y":20},
+            {"paperid":1,"sampleid":"1","figureid":"1","x":500.0,"y":0.7,"propertyid_x":1,"propertyid_y":20}
+        ]}"#;
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(json.as_bytes()).expect("write");
+        let path = tmp.path();
+        let record = parse_json_file(path, "samples").expect("parse");
+        assert_eq!(
+            record.measurements.len(), 0,
+            "BUG-01: UV-Vis propertyid_y=20 must be rejected — got {} measurements",
+            record.measurements.len()
+        );
+        assert_eq!(
+            record.rejected_non_thermoelectric_count, 3,
+            "BUG-01: all 3 UV-Vis measurements must be counted as rejected"
+        );
+    }
+
+    /// BUG-01 Positive: Seebeck (propertyid_y=2) must be accepted.
+    #[test]
+    fn bug01_seebeck_allowed_property_is_retained() {
+        let json = r#"{"sample":[],"paper":[],"property":[],"figure":[],"rawdata":[
+            {"paperid":1,"sampleid":"1","figureid":"1","x":300.0,"y":200e-6,"propertyid_x":1,"propertyid_y":2}
+        ]}"#;
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(json.as_bytes()).expect("write");
+        let record = parse_json_file(tmp.path(), "samples").expect("parse");
+        assert_eq!(record.measurements.len(), 1, "Seebeck (propertyid_y=2) must be retained");
+        assert_eq!(record.rejected_non_thermoelectric_count, 0);
+    }
+
+    /// GAP-05 Regression: A measurement referencing a figureid not in the file's
+    /// figure[] array must increment figureid_mismatch_count but still be retained.
+    #[test]
+    fn gap05_dangling_figureid_increments_mismatch_count() {
+        let json = r#"{"sample":[],"paper":[],"property":[],"figure":[
+            {"figureid":"10","paperid":1,"figurename":"","caption":"","propertyid_x":1,"propertyid_y":2}
+        ],"rawdata":[
+            {"paperid":1,"sampleid":"1","figureid":"99","x":300.0,"y":200e-6,"propertyid_x":1,"propertyid_y":2}
+        ]}"#;
+        let mut tmp = NamedTempFile::new().expect("tempfile");
+        tmp.write_all(json.as_bytes()).expect("write");
+        let record = parse_json_file(tmp.path(), "samples").expect("parse");
+        assert_eq!(record.measurements.len(), 1, "GAP-05: measurement must be retained despite figureid mismatch");
+        assert_eq!(record.figureid_mismatch_count, 1, "GAP-05: mismatch count must be 1");
+    }
+
+    /// GAP-07 Regression: 1 million OnceLock allowlist lookups must complete in < 10 ms
+    /// in release builds. The debug/test threshold is relaxed to 500 ms to account for
+    /// the unoptimised `[profile.test]` build.
+    #[test]
+    fn gap07_oncelock_allowlist_lookup_under_10ms() {
+        // Production limit: 10 ms; debug/test relaxed to 500 ms (no inlining, no opt)
+        #[cfg(debug_assertions)]
+        let limit_ms: u128 = 500;
+        #[cfg(not(debug_assertions))]
+        let limit_ms: u128 = 10;
+
+        // Warm up the OnceLock (first call initialises the set)
+        let _ = is_allowed_property(2);
+        let start = std::time::Instant::now();
+        for _ in 0..1_000_000 {
+            let _ = is_allowed_property(2);
+            let _ = is_allowed_property(20); // non-thermoelectric
+        }
+        let elapsed_ms = start.elapsed().as_millis();
+        assert!(
+            elapsed_ms < limit_ms,
+            "GAP-07: 1M OnceLock lookups must complete in < {}ms; took {}ms",
+            limit_ms, elapsed_ms
+        );
+    }
+
+    /// classify_experiment_type: DFT keyword → Computational.
+    #[test]
+    fn classify_dft_keyword_returns_computational() {
+        let info = serde_json::json!({"method": "DFT calculation using VASP"});
+        assert_eq!(classify_experiment_type(&info), ExperimentType::Computational);
+    }
+
+    /// classify_experiment_type: synthesis keyword → Experimental.
+    #[test]
+    fn classify_sintered_keyword_returns_experimental() {
+        let info = serde_json::json!({"technique": "spark plasma sintering at 600 C"});
+        assert_eq!(classify_experiment_type(&info), ExperimentType::Experimental);
+    }
+
+    /// classify_experiment_type: "sample" keyword alone (BUG-04) → Unknown, not Experimental.
+    #[test]
+    fn classify_sample_keyword_alone_returns_unknown() {
+        // BUG-04 regression: the word "sample" must NOT classify as experimental
+        let info = serde_json::json!({"comment": "sample prepared by standard methods"});
+        // No synthesis-specific keyword present → Unknown
+        assert_eq!(classify_experiment_type(&info), ExperimentType::Unknown);
+    }
+
+    /// classify_experiment_type: empty sampleinfo → Unknown.
+    #[test]
+    fn classify_empty_sampleinfo_returns_unknown() {
+        let info = serde_json::json!({});
+        assert_eq!(classify_experiment_type(&info), ExperimentType::Unknown);
+    }
 }

@@ -16,10 +16,20 @@ Author: Distinguished Professor of Computational Materials Science
 Institution: Thermognosis Engine Consortium
 """
 
+import warnings
 import numpy as np
 import pandas as pd
 from typing import Optional, Union, Tuple
 from dataclasses import dataclass
+
+warnings.warn(
+    "thermognosis.pipeline.validation is DEPRECATED. "
+    "Use rust_core.audit_thermodynamics_py() instead. "
+    "This Python module duplicates logic now owned by the Rust Triple-Gate Physics "
+    "Arbiter (SPEC-AUDIT-01) and will be removed in v1.0.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 # Fallback capability for heterogeneous hardware (GPU/CPU)
 # NumPy is highly optimized for vectorization, but CuPy can drop-in if available.
@@ -151,6 +161,11 @@ class ThermoelectricValidator:
         Tuple[np.ndarray, np.ndarray]
             (zT, zT_err) - The computed figure of merit and its absolute uncertainty.
         """
+        raise RuntimeError(
+            "DEPRECATED: ThermoelectricValidator.compute_zt() is superseded by "
+            "rust_core.compute_zt_from_csv_py() or rust_core.audit_thermodynamics_py(). "
+            "This Python implementation will be removed in a future release."
+        )
         S_arr = cls._to_array(S)
         sigma_arr = cls._to_array(sigma)
         T_arr = cls._to_array(T)
@@ -234,6 +249,11 @@ class ThermoelectricValidator:
         PhysicalConstraintError
             If `strict` is True and constraint violations exist.
         """
+        raise RuntimeError(
+            "DEPRECATED: ThermoelectricValidator.validate() is superseded by "
+            "rust_core.audit_thermodynamics_py(). "
+            "This Python implementation will be removed in a future release."
+        )
         # Convert all to deterministic numpy arrays
         T_arr = cls._to_array(T)
         S_arr = cls._to_array(S)
@@ -247,11 +267,15 @@ class ThermoelectricValidator:
         )
 
         # Vectorized Constraint Evaluation (SPEC-PHYS-CONSTRAINTS)
-        # NaN propagation explicitly handled: if nan, condition is False
-        valid_T = np.greater(T_arr, 0.0, where=~np.isnan(T_arr))
-        valid_sigma = np.greater(sigma_arr, 0.0, where=~np.isnan(sigma_arr))
-        valid_kappa = np.greater(kappa_arr, 0.0, where=~np.isnan(kappa_arr))
-        valid_zT = np.greater_equal(zT_arr, 0.0, where=~np.isnan(zT_arr))
+        # BUG-02 Fix: np.greater(arr, val, where=mask) leaves elements where
+        # mask=False in an *uninitialized* output buffer — undefined behavior
+        # that can silently pass NaN-containing rows as physically valid.
+        # np.where is well-defined for all elements: the False branch explicitly
+        # evaluates to the sentinel value False for every masked position.
+        valid_T     = np.where(~np.isnan(T_arr),     T_arr > 0.0,     False)
+        valid_sigma = np.where(~np.isnan(sigma_arr), sigma_arr > 0.0, False)
+        valid_kappa = np.where(~np.isnan(kappa_arr), kappa_arr > 0.0, False)
+        valid_zT    = np.where(~np.isnan(zT_arr),    zT_arr >= 0.0,   False)
 
         # Intersection of all physically admissible spaces
         is_valid = valid_T & valid_sigma & valid_kappa & valid_zT & ~np.isnan(zT_arr)
