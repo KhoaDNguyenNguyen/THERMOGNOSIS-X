@@ -366,6 +366,71 @@ def _emit_audit_telemetry(
     logger.info(sep)
 
 
+def _check_sigma_rho_consistency(
+    df: pd.DataFrame,
+    col_sigma: str,
+    anomaly_flags: np.ndarray,
+) -> int:
+    """
+    Set ``FLAG_SIGMA_RHO_INCON`` (bit 3) where |σ·ρ − 1| > 5%.
+
+    When both electrical conductivity σ (S/m) and electrical resistivity ρ
+    (ohm·m) are present for the same record, the identity σ = 1/ρ must hold
+    within 5% tolerance (accounting for combined digitization noise and
+    instrument uncertainty). Deviation beyond this threshold implies an
+    inconsistency between separately reported values — e.g., σ and ρ from
+    different measurement runs, temperature offsets, or a unit error in one of
+    the two quantities.
+
+    The check modifies ``anomaly_flags`` in-place.
+
+    # TODO: migrate to Rust for production
+    #        The Rust implementation would compare σ and ρ per (sample, T) pair
+    #        within mirror_walker.rs or a dedicated pass in audit.rs.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source DataFrame.
+    col_sigma : str
+        Column name for electrical conductivity (S/m).
+    anomaly_flags : np.ndarray of int32
+        Mutable anomaly flag array from the physics audit (modified in-place).
+
+    Returns
+    -------
+    int
+        Number of records flagged with FLAG_SIGMA_RHO_INCON.
+    """
+    _FLAG_SIGMA_RHO_INCON = 1 << 3
+    _TOLERANCE = 0.05
+
+    rho_col = next(
+        (c for c in ("rho", "resistivity", "electrical_resistivity", "rho_ohm_m",
+                     "rho_Ohm_m", "elec_resistivity")
+         if c in df.columns),
+        None,
+    )
+    if rho_col is None:
+        return 0  # No resistivity column present; check is skipped.
+
+    sigma_vals = pd.to_numeric(df[col_sigma], errors="coerce").values
+    rho_vals   = pd.to_numeric(df[rho_col],   errors="coerce").values
+
+    count = 0
+    for i in range(len(df)):
+        s_val = float(sigma_vals[i])
+        r_val = float(rho_vals[i])
+        if (np.isfinite(s_val) and np.isfinite(r_val)
+                and s_val > 0.0 and r_val > 0.0):
+            product = s_val * r_val
+            if abs(product - 1.0) > _TOLERANCE:
+                anomaly_flags[i] = int(anomaly_flags[i]) | _FLAG_SIGMA_RHO_INCON
+                count += 1
+
+    return count
+
+
 def _build_records(df: pd.DataFrame, audit: Dict[str, np.ndarray]) -> list:
     """
     Fuse the raw DataFrame rows with their audit trail vectors to produce
@@ -589,6 +654,20 @@ def main(args: argparse.Namespace) -> int:
     # Merge dedup flags into the physics audit's anomaly_flags array.
     if np.any(dedup_flags != 0):
         audit["anomaly_flags"] = (audit["anomaly_flags"].astype(np.int32) | dedup_flags)
+
+    # -----------------------------------------------------------------------
+    # Stage 2.6: σ·ρ Consistency Check (FLAG_SIGMA_RHO_INCON, bit 3)
+    # Runs after dedup merge so that the final anomaly_flags array is updated
+    # in-place. Only has effect when the source file contains a resistivity
+    # column alongside the electrical-conductivity column.
+    # -----------------------------------------------------------------------
+    sigma_rho_flagged = _check_sigma_rho_consistency(df, col_sigma, audit["anomaly_flags"])
+    if sigma_rho_flagged > 0:
+        logger.info(
+            "σ·ρ consistency check: %d record(s) flagged with FLAG_SIGMA_RHO_INCON"
+            " (|σ·ρ − 1| > 5%%).",
+            sigma_rho_flagged,
+        )
 
     # -----------------------------------------------------------------------
     # Stage 4: Telemetry Report
