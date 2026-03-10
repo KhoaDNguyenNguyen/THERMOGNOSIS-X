@@ -212,12 +212,23 @@ Rejected records are written exclusively to `bad_records_report.jsonl`.
 cryogenic characterisation outside the practical application domain (refrigerators
 and generators operate between ~200 K and ~1200 K for most reported materials).
 Above 2000 K, virtually all thermoelectric materials have decomposed or melted.
-Records with T outside this range are flagged but not automatically rejected;
-they are classified as TierC if all other gates pass.
+Records with T outside this range are **flagged but not automatically rejected**.
+They are classified as `TierC` if all other gates pass (soft flag).
 
-**Thresholds**: `T_MIN_K = 100.0 K`, `T_MAX_K = 2000.0 K`.
+**Thresholds**: `T_MIN_K = 100.0 K`, `T_MAX_K = 2000.0 K` (defined in `constants.rs`).
 
-**Implementation**: `physics.rs::validate_empirical_bounds()`.
+**Flag**: `FLAG_TEMPERATURE_OUT_OF_RANGE` (bit 12). Setting this flag downgrades
+the record to at most `TierC`; no derived quantities (zT, L, κ_lattice) are
+suppressed. The flag is a soft warning, not a hard reject.
+
+**Implementation**: `audit.rs::triple_check_physics()`, temperature domain check
+block (after Gate 1b, before Gate 2). `physics.rs::validate_empirical_bounds()`
+also enforces this range for the scalar `compute_zt()` path; the Triple-Gate
+Arbiter (`audit.rs`) is the single canonical authority for T-range policy in
+the Q1 pipeline (`generate_q1_dataset.py`).
+
+**Unit tests**: `audit.rs::temperature_below_100k_sets_out_of_range_flag`,
+`audit.rs::temperature_above_2000k_sets_out_of_range_flag`.
 
 ---
 
@@ -236,16 +247,77 @@ audits.
 
 ---
 
+## 10b. Seebeck Coefficient Sign Convention (Known Limitation)
+
+The pipeline validates the **magnitude** |S| against the empirical upper bound
+(Stage 4, Gate 1b: |S| ≤ 1000 µV/K). It does **not** enforce sign convention
+consistency between p-type (S > 0) and n-type (S < 0) materials.
+
+**Implication for reviewers**: Records with physically implausible sign
+combinations (e.g., a positive S assigned to a material known to be n-type)
+are not flagged by the current implementation. The Starrydata corpus does not
+include carrier-type annotations on a per-measurement basis, making automated
+sign-consistency enforcement infeasible without additional metadata.
+
+**Recommendation**: Downstream analyses that distinguish p-type from n-type
+branches should apply a sign filter post-hoc using the `composition` field
+or literature-derived carrier-type labels. This limitation should be disclosed
+in the dataset description.
+
+**Future work**: A carrier-type annotation field (`carrier_type`: p/n/unknown)
+could be added to the output schema in a future pipeline version, enabling
+sign-consistency validation.
+
+---
+
 ## 11. Unit Conversion
 
-All property values are converted to SI units before any physics check.
-The conversion registry is defined in `unit_registry.toml`. Records with
-unrecognized unit strings receive `FLAG_UNIT_UNKNOWN` (bit 2) and are excluded
-from the clean dataset. The full conversion audit trail is written to
-`conversion_audit.jsonl`.
+All property values should be converted to SI units before any physics check.
+The conversion registry is defined in `unit_registry.toml`, which maps every
+known Starrydata unit string to its SI equivalent via an affine transformation
+(si_value = raw_value × factor + offset).
 
-**Status**: TOML registry created (`unit_registry.toml`). Rust `UnitConverter`
-integration is in progress (GAP-02 partial implementation).
+**Current implementation status (GAP-02)**:
+- TOML registry: **complete** (`unit_registry.toml`; 40+ unit strings mapped).
+- Rust `UnitConverter` integration: **not yet wired** into the main Q1
+  generation pipeline (`generate_q1_dataset.py` / `mirror_walker.rs` full path).
+- Current workaround: The Starrydata mirror data is assumed to be pre-normalized
+  to SI units by the ingestion pipeline (`scripts/run_starrydata_fast.py`).
+  Records with unrecognized unit strings **currently pass through without
+  `FLAG_UNIT_UNKNOWN` being set** — this is a known gap.
+- `FLAG_UNIT_UNKNOWN` (bit 2) is defined in `flags.rs` and will be set once
+  the UnitConverter is wired into the pipeline in a future release.
+
+**Audit trail**: When the UnitConverter integration is complete, the full
+conversion audit trail will be written to `conversion_audit.jsonl`.
+
+---
+
+## 13. Default Measurement Uncertainty Assumption
+
+When measurement uncertainties are not explicitly reported in the source
+publication, the pipeline applies a default relative uncertainty of **5%** to
+all four transport properties (S, σ, κ, T). This assumption is used in the
+first-order error propagation of zT (P02-ZT-ERROR-PROPAGATION) in
+`orchestrator.py`.
+
+**Physical justification**: The 5% value is a conservative upper bound consistent
+with:
+- WebPlotDigitizer digitization uncertainty: ~2–3% for well-defined curves,
+  up to 5% near axis boundaries (Rohatgi, 2022).
+- ZEM-3 (ULVAC) Seebeck/electrical conductivity measurement system: ≤5%
+  combined relative uncertainty.
+- LFA 457 (Netzsch) laser flash thermal diffusivity system: ≤3% reproducibility.
+
+Reference: Rohatgi, A. (2022). WebPlotDigitizer v4.6. Pacifica, CA, USA.
+Available at: https://automeris.io/WebPlotDigitizer
+
+**Implementation**: `orchestrator.py::DEFAULT_RELATIVE_UNCERTAINTY = 0.05`.
+
+**Reproducibility**: The `--uncertainty-pct` flag in `generate_q1_dataset.py`
+(default: 5.0) logs the assumed percentage in the telemetry report and is
+available for sensitivity analysis. Supplementary analysis with 2% and 10%
+assumptions is recommended.
 
 ---
 
@@ -261,6 +333,7 @@ integration is in progress (GAP-02 partial implementation).
 | Gate 2: Wiedemann-Franz         | `audit.rs::triple_check_physics()`  | Gate 2 block                                |
 | Gate 3: ZT cross-check          | `audit.rs::triple_check_physics()`  | Gate 3 block                                |
 | ZT batch computation            | `physics.rs::calc_zt_batch()`       | Uses canonical constants                     |
-| Flag definitions                | `flags.rs`                          | All `FLAG_*` constants                      |
+| Temperature domain (soft flag)  | `audit.rs::triple_check_physics()`  | `FLAG_TEMPERATURE_OUT_OF_RANGE` (bit 12)    |
+| Flag definitions                | `flags.rs`                          | All `FLAG_*` constants (13 flags, bits 0–12) |
 | NumPy constraint evaluation     | `validation.py::ThermoelectricValidator.validate()` | BUG-02 corrected |
 | Experiment classification       | `ingestion.py::classify_experiment_type()` | BUG-04 corrected            |
