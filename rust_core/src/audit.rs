@@ -29,10 +29,11 @@
 use rayon::prelude::*;
 use thiserror::Error;
 
-use crate::constants::{L0_SOMMERFELD, L_MIN, L_MAX, SEEBECK_MAX_ABS_V_PER_K, SIGMA_MAX_S_PER_M, KAPPA_MAX_W_PER_MK};
+use crate::constants::{L0_SOMMERFELD, L_MIN, L_MAX, SEEBECK_MAX_ABS_V_PER_K, SIGMA_MAX_S_PER_M, KAPPA_MAX_W_PER_MK, T_MIN_K, T_MAX_K};
 use crate::flags::{
     FLAG_WF_VIOLATION, FLAG_ZT_CROSSCHECK_FAIL,
     FLAG_SEEBECK_BOUND_EXCEED, FLAG_SIGMA_BOUND_EXCEED, FLAG_KAPPA_BOUND_EXCEED,
+    FLAG_TEMPERATURE_OUT_OF_RANGE,
 };
 
 // Re-export canonical flags under the legacy names used by existing Python consumers.
@@ -245,6 +246,24 @@ pub fn triple_check_physics(
             tier: ConfidenceTier::Reject as u8,
             anomaly_flags: flags,
         };
+    }
+
+    // -------------------------------------------------------------------------
+    // TEMPERATURE DOMAIN CHECK (soft flag — VALIDATION_METHODOLOGY.md §9)
+    // T ∉ [T_MIN_K, T_MAX_K] = [100 K, 2000 K]:
+    //   - NOT a hard reject: zT, L, and κ_lattice are still computed.
+    //   - Downgrades the record to at most TierC.
+    // Physical rationale: below 100 K, measurements are cryogenic
+    // characterisation outside the practical application domain; above 2000 K,
+    // most thermoelectric materials have decomposed or melted.
+    // Per VALIDATION_METHODOLOGY.md §9: "flagged but not automatically rejected".
+    // -------------------------------------------------------------------------
+    if t < T_MIN_K || t > T_MAX_K {
+        flags |= FLAG_TEMPERATURE_OUT_OF_RANGE;
+        // Soft downgrade: only worsen the tier, never improve it.
+        if tier < ConfidenceTier::TierC {
+            tier = ConfidenceTier::TierC;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -476,6 +495,57 @@ mod tests {
         let rec = triple_check_physics(200e-6, 1e5, 500.0, 300.0, f64::NAN);
         assert_eq!(rec.tier, ConfidenceTier::Reject as u8);
         assert_ne!(rec.anomaly_flags & FLAG_KAPPA_BOUND_EXCEED, 0);
+    }
+
+    /// P0-3: T = 50 K is below T_MIN_K (100 K).
+    /// The state is algebraically valid (T > 0) but outside the operational domain.
+    /// Expectation: FLAG_TEMPERATURE_OUT_OF_RANGE set; tier = TierC; zT is finite.
+    /// Physics parameters chosen so that Gate 2 passes at T=50K:
+    ///   κ=0.3 W/mK, σ=1e5 S/m → L=0.3/(1e5·50)=6e-8 ∈ [L_MIN, L_MAX];
+    ///   κ_lattice = 0.3 − 2.44e-8·1e5·50 = 0.3 − 0.122 = 0.178 ≥ 0.
+    #[test]
+    fn temperature_below_100k_sets_out_of_range_flag() {
+        let rec = triple_check_physics(200e-6, 1e5, 0.3, 50.0, f64::NAN);
+
+        assert_ne!(
+            rec.anomaly_flags & FLAG_TEMPERATURE_OUT_OF_RANGE, 0,
+            "FLAG_TEMPERATURE_OUT_OF_RANGE must be set for T=50 K"
+        );
+        assert_eq!(
+            rec.tier, ConfidenceTier::TierC as u8,
+            "Record must be downgraded to TierC for T=50 K"
+        );
+        // Soft flag: zT must still be computed, not NaN.
+        assert!(
+            rec.zt_computed.is_finite(),
+            "zT must remain finite — T=50 K is a soft flag, not a hard reject"
+        );
+        // Hard-reject flags must NOT be set.
+        assert_eq!(rec.anomaly_flags & FLAG_ALGEBRAIC_REJECT, 0);
+    }
+
+    /// P0-3: T = 2500 K is above T_MAX_K (2000 K).
+    /// Same expectation: FLAG_TEMPERATURE_OUT_OF_RANGE; tier = TierC; zT finite.
+    /// Physics parameters chosen so that Gate 2 passes at T=2500K:
+    ///   κ=10 W/mK, σ=1e5 S/m → L=10/(1e5·2500)=4e-8 ∈ [L_MIN, L_MAX];
+    ///   κ_lattice = 10 − 2.44e-8·1e5·2500 = 10 − 6.1 = 3.9 ≥ 0.
+    #[test]
+    fn temperature_above_2000k_sets_out_of_range_flag() {
+        let rec = triple_check_physics(200e-6, 1e5, 10.0, 2500.0, f64::NAN);
+
+        assert_ne!(
+            rec.anomaly_flags & FLAG_TEMPERATURE_OUT_OF_RANGE, 0,
+            "FLAG_TEMPERATURE_OUT_OF_RANGE must be set for T=2500 K"
+        );
+        assert_eq!(
+            rec.tier, ConfidenceTier::TierC as u8,
+            "Record must be downgraded to TierC for T=2500 K"
+        );
+        assert!(
+            rec.zt_computed.is_finite(),
+            "zT must remain finite — T=2500 K is a soft flag, not a hard reject"
+        );
+        assert_eq!(rec.anomaly_flags & FLAG_ALGEBRAIC_REJECT, 0);
     }
 
     #[test]

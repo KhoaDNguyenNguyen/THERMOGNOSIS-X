@@ -12,20 +12,21 @@
 //!
 //! ## Bitmask Layout (u32)
 //!
-//! | Bit | Constant                   | Meaning                                                    |
-//! |-----|----------------------------|------------------------------------------------------------|
-//! |   0 | `FLAG_WF_VIOLATION`        | Wiedemann-Franz violation (κ_lattice < 0 or L out of bounds) |
-//! |   1 | `FLAG_ZT_CROSSCHECK_FAIL`  | ZT cross-check MAE exceeds tolerance                       |
-//! |   2 | `FLAG_UNIT_UNKNOWN`        | Unit string not found in unit_registry.toml                |
-//! |   3 | `FLAG_SIGMA_RHO_INCON`     | σ·ρ consistency ratio deviates > 5% from unity             |
-//! |   4 | `FLAG_LOW_CONFIDENCE_EXP`  | Experiment type classified with low confidence             |
-//! |   5 | `FLAG_INTERP_INSUFFICIENT` | Fewer than 3 common grid points for ZT cross-check         |
-//! |   6 | `FLAG_SEEBECK_BOUND_EXCEED`| |S| > SEEBECK_MAX_ABS_V_PER_K (1000 µV/K)                 |
-//! |   7 | `FLAG_SIGMA_BOUND_EXCEED`  | σ > SIGMA_MAX_S_PER_M (10⁷ S/m)                           |
-//! |   8 | `FLAG_KAPPA_BOUND_EXCEED`  | κ > KAPPA_MAX_W_PER_MK (100 W/(m·K))                      |
-//! |   9 | `FLAG_FIGUREID_MISMATCH`   | figureid absent from the record's figure array             |
-//! |  10 | `FLAG_DUPLICATE_SUSPECTED` | BloomFilter indicates a likely duplicate record            |
-//! |  11 | `FLAG_ALGEBRAIC_REJECT`    | T ≤ 0, σ ≤ 0, or κ ≤ 0 — state is thermodynamically undefined |
+//! | Bit | Constant                        | Meaning                                                    |
+//! |-----|---------------------------------|------------------------------------------------------------|
+//! |   0 | `FLAG_WF_VIOLATION`             | Wiedemann-Franz violation (κ_lattice < 0 or L out of bounds) |
+//! |   1 | `FLAG_ZT_CROSSCHECK_FAIL`       | ZT cross-check MAE exceeds tolerance                       |
+//! |   2 | `FLAG_UNIT_UNKNOWN`             | Unit string not found in unit_registry.toml                |
+//! |   3 | `FLAG_SIGMA_RHO_INCON`          | σ·ρ consistency ratio deviates > 5% from unity             |
+//! |   4 | `FLAG_LOW_CONFIDENCE_EXP`       | Experiment type classified with low confidence             |
+//! |   5 | `FLAG_INTERP_INSUFFICIENT`      | Fewer than 3 common grid points for ZT cross-check         |
+//! |   6 | `FLAG_SEEBECK_BOUND_EXCEED`     | |S| > SEEBECK_MAX_ABS_V_PER_K (1000 µV/K)                 |
+//! |   7 | `FLAG_SIGMA_BOUND_EXCEED`       | σ > SIGMA_MAX_S_PER_M (10⁷ S/m)                           |
+//! |   8 | `FLAG_KAPPA_BOUND_EXCEED`       | κ > KAPPA_MAX_W_PER_MK (100 W/(m·K))                      |
+//! |   9 | `FLAG_FIGUREID_MISMATCH`        | figureid absent from the record's figure array             |
+//! |  10 | `FLAG_DUPLICATE_SUSPECTED`      | BloomFilter indicates a likely duplicate record            |
+//! |  11 | `FLAG_ALGEBRAIC_REJECT`         | T ≤ 0, σ ≤ 0, or κ ≤ 0 — state is thermodynamically undefined |
+//! |  12 | `FLAG_TEMPERATURE_OUT_OF_RANGE` | T ∉ [T_MIN_K, T_MAX_K] = [100 K, 2000 K] — soft flag; TierC |
 
 /// Wiedemann-Franz violation: κ_lattice < 0 (electronic κ exceeds total κ) or
 /// effective Lorenz number outside [L_MIN, L_MAX].
@@ -92,6 +93,22 @@ pub const FLAG_DUPLICATE_SUSPECTED: u32 = 1 << 10;
 /// (zT, L, κ_lattice) can be computed. The record is unconditionally rejected.
 pub const FLAG_ALGEBRAIC_REJECT: u32 = 1 << 11;
 
+/// Temperature outside the operational domain [T_MIN_K, T_MAX_K] = [100 K, 2000 K].
+///
+/// This is a **soft flag**: the record is NOT unconditionally rejected. All three
+/// physics gates are still evaluated and zT is still computed. The record is
+/// downgraded to at most `ConfidenceTier::TierC` if all other gates pass.
+///
+/// Physical rationale: below 100 K, thermoelectric measurements typically represent
+/// cryogenic characterisation outside the practical application domain of the
+/// Thermognosis dataset. Above 2000 K, most thermoelectric materials have
+/// decomposed or melted. Records in this range should be interpreted with caution.
+///
+/// Per `VALIDATION_METHODOLOGY.md` Section 9 (T domain constraints), this flag
+/// does not imply a thermodynamic impossibility — only an extrapolation outside
+/// the standard operating regime.
+pub const FLAG_TEMPERATURE_OUT_OF_RANGE: u32 = 1 << 12;
+
 // ============================================================================
 // CONVENIENCE: Decode a bitmask to a list of human-readable flag names
 // ============================================================================
@@ -110,18 +127,19 @@ pub const FLAG_ALGEBRAIC_REJECT: u32 = 1 << 11;
 /// ```
 pub fn decode_flags(flags: u32) -> Vec<&'static str> {
     let all: &[(u32, &str)] = &[
-        (FLAG_WF_VIOLATION,        "FLAG_WF_VIOLATION"),
-        (FLAG_ZT_CROSSCHECK_FAIL,  "FLAG_ZT_CROSSCHECK_FAIL"),
-        (FLAG_UNIT_UNKNOWN,        "FLAG_UNIT_UNKNOWN"),
-        (FLAG_SIGMA_RHO_INCON,     "FLAG_SIGMA_RHO_INCON"),
-        (FLAG_LOW_CONFIDENCE_EXP,  "FLAG_LOW_CONFIDENCE_EXP"),
-        (FLAG_INTERP_INSUFFICIENT, "FLAG_INTERP_INSUFFICIENT"),
-        (FLAG_SEEBECK_BOUND_EXCEED,"FLAG_SEEBECK_BOUND_EXCEED"),
-        (FLAG_SIGMA_BOUND_EXCEED,  "FLAG_SIGMA_BOUND_EXCEED"),
-        (FLAG_KAPPA_BOUND_EXCEED,  "FLAG_KAPPA_BOUND_EXCEED"),
-        (FLAG_FIGUREID_MISMATCH,   "FLAG_FIGUREID_MISMATCH"),
-        (FLAG_DUPLICATE_SUSPECTED, "FLAG_DUPLICATE_SUSPECTED"),
-        (FLAG_ALGEBRAIC_REJECT,    "FLAG_ALGEBRAIC_REJECT"),
+        (FLAG_WF_VIOLATION,              "FLAG_WF_VIOLATION"),
+        (FLAG_ZT_CROSSCHECK_FAIL,        "FLAG_ZT_CROSSCHECK_FAIL"),
+        (FLAG_UNIT_UNKNOWN,              "FLAG_UNIT_UNKNOWN"),
+        (FLAG_SIGMA_RHO_INCON,           "FLAG_SIGMA_RHO_INCON"),
+        (FLAG_LOW_CONFIDENCE_EXP,        "FLAG_LOW_CONFIDENCE_EXP"),
+        (FLAG_INTERP_INSUFFICIENT,       "FLAG_INTERP_INSUFFICIENT"),
+        (FLAG_SEEBECK_BOUND_EXCEED,      "FLAG_SEEBECK_BOUND_EXCEED"),
+        (FLAG_SIGMA_BOUND_EXCEED,        "FLAG_SIGMA_BOUND_EXCEED"),
+        (FLAG_KAPPA_BOUND_EXCEED,        "FLAG_KAPPA_BOUND_EXCEED"),
+        (FLAG_FIGUREID_MISMATCH,         "FLAG_FIGUREID_MISMATCH"),
+        (FLAG_DUPLICATE_SUSPECTED,       "FLAG_DUPLICATE_SUSPECTED"),
+        (FLAG_ALGEBRAIC_REJECT,          "FLAG_ALGEBRAIC_REJECT"),
+        (FLAG_TEMPERATURE_OUT_OF_RANGE,  "FLAG_TEMPERATURE_OUT_OF_RANGE"),
     ];
     all.iter()
         .filter(|(bit, _)| flags & bit != 0)
@@ -144,6 +162,7 @@ mod tests {
             FLAG_SIGMA_RHO_INCON, FLAG_LOW_CONFIDENCE_EXP, FLAG_INTERP_INSUFFICIENT,
             FLAG_SEEBECK_BOUND_EXCEED, FLAG_SIGMA_BOUND_EXCEED, FLAG_KAPPA_BOUND_EXCEED,
             FLAG_FIGUREID_MISMATCH, FLAG_DUPLICATE_SUSPECTED, FLAG_ALGEBRAIC_REJECT,
+            FLAG_TEMPERATURE_OUT_OF_RANGE,
         ];
         for f in &all_flags {
             assert!(f.is_power_of_two(), "Flag {f:#010x} is not a power of two");
@@ -169,11 +188,18 @@ mod tests {
     }
 
     #[test]
-    fn decode_flags_on_all_bits_returns_twelve_names() {
+    fn decode_flags_on_all_bits_returns_thirteen_names() {
         let all = FLAG_WF_VIOLATION | FLAG_ZT_CROSSCHECK_FAIL | FLAG_UNIT_UNKNOWN
             | FLAG_SIGMA_RHO_INCON | FLAG_LOW_CONFIDENCE_EXP | FLAG_INTERP_INSUFFICIENT
             | FLAG_SEEBECK_BOUND_EXCEED | FLAG_SIGMA_BOUND_EXCEED | FLAG_KAPPA_BOUND_EXCEED
-            | FLAG_FIGUREID_MISMATCH | FLAG_DUPLICATE_SUSPECTED | FLAG_ALGEBRAIC_REJECT;
-        assert_eq!(decode_flags(all).len(), 12);
+            | FLAG_FIGUREID_MISMATCH | FLAG_DUPLICATE_SUSPECTED | FLAG_ALGEBRAIC_REJECT
+            | FLAG_TEMPERATURE_OUT_OF_RANGE;
+        assert_eq!(decode_flags(all).len(), 13);
+    }
+
+    #[test]
+    fn temperature_out_of_range_flag_is_bit_12() {
+        assert_eq!(FLAG_TEMPERATURE_OUT_OF_RANGE, 1 << 12);
+        assert!(FLAG_TEMPERATURE_OUT_OF_RANGE.is_power_of_two());
     }
 }
