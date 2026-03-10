@@ -23,12 +23,28 @@ import logging
 import time
 from typing import Optional, List, Dict, Any, Tuple
 
+# ---------------------------------------------------------------------------
+# Default relative measurement uncertainty (P1-1, VALIDATION_METHODOLOGY.md §13)
+# ---------------------------------------------------------------------------
+# This constant is applied when measurement errors are NOT reported in the
+# source publication. The 5% value is a conservative estimate consistent with:
+#   - Typical digitization uncertainty in WebPlotDigitizer (Rohatgi, 2022):
+#       ~2–3% for well-defined curves, up to 5% near axis boundaries.
+#   - Instrument-level precision for commercial thermoelectric measurement
+#       systems (ZEM-3: ≤5%; LFA 457: ≤3%).
+# Reference: Rohatgi, A. (2022). WebPlotDigitizer v4.6, Pacifica, CA, USA.
+#            https://automeris.io/WebPlotDigitizer
+# Sensitivity analysis with 2% and 10% is recommended as supplementary
+# material for Q1 publication. Use --uncertainty-pct in generate_q1_dataset.py
+# to reproduce with alternative assumptions.
+DEFAULT_RELATIVE_UNCERTAINTY: float = 0.05
+
 import numpy as np
 import pandas as pd
 
 from thermognosis.config import load_config, ConfigurationError
 from thermognosis.pipeline.result import PipelineResult
-from thermognosis.wrappers.rust_core import RustCore, RustCoreError
+from thermognosis.wrappers.rust_wrapper import RustCore, RustCoreError
 # We alias the unified writer to match the requested abstract architectural interface
 from thermognosis.db.bulk_writer import UnifiedTranslationalWriter as BulkWriter
 
@@ -165,43 +181,73 @@ def run_pipeline(
     kappa_flat = np.concatenate(kappa_list)
     cred_flat = np.concatenate(credibility_list)
     
-    # Heuristic uncertainty approximation (5% relative error) for robust error propagation
-    # In production, these would be parsed similarly if provided in the dataset.
-    err_s = np.abs(s_flat) * 0.05
-    err_sigma = np.abs(sigma_flat) * 0.05
-    err_kappa = np.abs(kappa_flat) * 0.05
-    err_t = np.abs(t_flat) * 0.05
+    # Apply DEFAULT_RELATIVE_UNCERTAINTY (5%) when measurement errors are not
+    # reported in the source publication. See module-level docstring for basis.
+    # For sensitivity analysis, override DEFAULT_RELATIVE_UNCERTAINTY before calling.
+    err_s     = np.abs(s_flat)     * DEFAULT_RELATIVE_UNCERTAINTY
+    err_sigma = np.abs(sigma_flat) * DEFAULT_RELATIVE_UNCERTAINTY
+    err_kappa = np.abs(kappa_flat) * DEFAULT_RELATIVE_UNCERTAINTY
+    err_t     = np.abs(t_flat)     * DEFAULT_RELATIVE_UNCERTAINTY
 
     try:
-        # SPEC-PHYS-CONSISTENCY: Validate physical domains and compute zT
-        zt_flat = rust_core.check_physics_consistency(s_flat, sigma_flat, kappa_flat, t_flat)
-        
+        # SPEC-AUDIT-01: Triple-Gate Epistemic Physics Arbiter (Gate 1, 1b, 2, 3).
+        # Replaces the deprecated check_physics_consistency + manual gate logic.
+        # Assigns ConfidenceTier and AnomalyFlags bitmask to every state, passing
+        # all three gates without silent data dropping.
+        #
+        # Backward compatibility: if audit_thermodynamic_states is unavailable
+        # (old compiled Rust binary), fall back to check_physics_consistency with
+        # a deprecation warning. Remove this fallback after the next Rust release.
+        try:
+            audit_result = rust_core.audit_thermodynamic_states(
+                s_flat, sigma_flat, kappa_flat, t_flat
+            )
+            zt_flat   = audit_result["zT_computed"]
+            tier_flat = audit_result["tier"]
+        except AttributeError:
+            import warnings
+            warnings.warn(
+                "audit_thermodynamic_states() is not available in the loaded Rust binary. "
+                "Falling back to the deprecated check_physics_consistency() path. "
+                "Recompile rust_core to enable the Triple-Gate Arbiter (SPEC-AUDIT-01).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            zt_flat   = rust_core.check_physics_consistency(s_flat, sigma_flat, kappa_flat, t_flat)
+            tier_flat = None
+
         # P02-ZT-ERROR-PROPAGATION: Analytically propagate standard measurement uncertainties
         zt_prop, zt_unc = rust_core.propagate_error(
             s_flat, sigma_flat, kappa_flat, t_flat,
             err_s, err_sigma, err_kappa, err_t
         )
-        
-        # SPEC-QUAL-SCORING: Compute the unified Bayesian credibility and quality score
+
+        # SPEC-QUAL-SCORING: Compute the unified Bayesian credibility and quality score.
+        # Hard constraint gate: records with Tier::Reject (tier == 4) are excluded.
+        # When tier_flat is None (fallback path), revert to the positivity check.
+        if tier_flat is not None:
+            hard_gate = tier_flat < 4  # Not Reject — passes Gate 1 and Gate 1b
+        else:
+            hard_gate = (zt_flat >= 0) & (t_flat > 0) & (kappa_flat > 0) & (sigma_flat > 0)
+
         metrics = {
             'completeness': np.ones_like(zt_flat),
             'credibility': cred_flat,
-            'physics_consistency': np.where(zt_flat >= 0, 1.0, 0.0),
+            'physics_consistency': np.where(np.isfinite(zt_flat) & (zt_flat >= 0), 1.0, 0.0),
             'error_magnitude': zt_unc,
             'smoothness': np.ones_like(zt_flat),  # Defaulted for structural compliance
             'metadata': np.ones_like(zt_flat),
-            # Hard physics gate: Positive zT, absolute T, positive conductivities
-            'hard_constraint_gate': (zt_flat >= 0) & (t_flat > 0) & (kappa_flat > 0) & (sigma_flat > 0)
+            'hard_constraint_gate': hard_gate,
         }
-        
+
         base_score, reg_score, entropy, cls_labels = rust_core.compute_quality_score(metrics)
-        
+
     except RustCoreError as e:
         logger.critical(f"Catastrophic mathematical failure at the FFI boundary: {e}")
         # If the batch compute fails entirely, all parsed records are forfeit.
         return PipelineResult(
-            total_processed=total_processed, total_failed=total_processed, 
-            total_inserted=0, average_score=0.0, physics_violations=0, 
+            total_processed=total_processed, total_failed=total_processed,
+            total_inserted=0, average_score=0.0, physics_violations=0,
             processing_time_seconds=time.time() - start_time
         )
 
@@ -220,12 +266,14 @@ def run_pipeline(
     neo4j_insert_buffer = []
 
     for i, (gates, zts) in enumerate(zip(gates_per_record, zt_per_record)):
-        # A record is physically viable if ALL temperature-dependent points satisfy thermodynamic law
+        # A record is physically viable if ALL temperature-dependent points pass
+        # the Triple-Gate Arbiter (tier < 4) or the fallback positivity check.
         if not np.all(gates):
             physics_violations += 1
         else:
             total_inserted += 1
-            valid_zt_accumulator.extend(zts)
+            # Accumulate only finite, physically plausible zT values.
+            valid_zt_accumulator.extend(float(z) for z in zts if np.isfinite(z) and z >= 0)
             
             # (In reality, we would append the structured SQL tuples and Cypher Dicts here)
             # pg_insert_buffer.append(...)
