@@ -43,6 +43,7 @@ The script accepts flexible column name variants for each physical quantity
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import sys
 import time
@@ -180,10 +181,95 @@ def _extract_arrays(
     return s_arr, sigma_arr, kappa_arr, t_arr, zt_arr
 
 
+def _compute_dedup_flags(
+    df: pd.DataFrame,
+    col_t: str,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """
+    Python-side record deduplication using SHA-256 keyed by (paper_id,
+    normalised_composition, temperature_bucket).
+
+    The deduplication key construction mirrors the Rust implementation in
+    ``rust_core/src/dedup.rs`` (``make_dedup_key`` / ``normalize_composition`` /
+    ``temperature_range_bucket``):
+
+    - Composition tokens are split on whitespace/comma and sorted alphabetically
+      before concatenation, matching ``normalize_composition()``.
+    - Temperature is discretised into 50 K bins matching
+      ``temperature_range_bucket()`` with ``bucket_size=50``.
+    - Key format: ``paper_id\x00norm_composition\x00t_bucket``
+
+    The output flag array uses ``FLAG_DUPLICATE_SUSPECTED`` (bit 10 = 1024),
+    which matches the GAP-03 canonical scheme in ``flags.rs``.
+
+    # TODO: migrate to Rust BloomFilter for production use
+    #        (see rust_core/src/dedup.rs — capacity=5_000_000, FPR≤1e-6)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Source DataFrame after column-mapping.
+    col_t : str
+        Name of the temperature column (used for T-bucket computation).
+
+    Returns
+    -------
+    flags : np.ndarray of int32
+        Per-row flag array; 0 for unique, ``FLAG_DUPLICATE_SUSPECTED`` for dupes.
+    stats : dict
+        ``{"unique": int, "duplicate": int}``.
+    """
+    _FLAG_DUPLICATE_SUSPECTED = 1 << 10
+
+    # Resolve metadata columns for the dedup key.
+    comp_col = next(
+        (c for c in ("composition", "material", "formula", "compound") if c in df.columns),
+        None,
+    )
+    pid_col = next(
+        (c for c in ("doi", "paper_id", "ref_id", "reference_id") if c in df.columns),
+        None,
+    )
+
+    seen: set = set()
+    flags = np.zeros(len(df), dtype=np.int32)
+    duplicate_count = 0
+
+    t_series = pd.to_numeric(df[col_t], errors="coerce")
+
+    for i, row in enumerate(df.itertuples(index=False)):
+        composition = str(getattr(row, comp_col, "unknown")) if comp_col else "unknown"
+        paper_id    = str(getattr(row, pid_col,  "0"))       if pid_col  else "0"
+
+        # Alphabetically sort composition tokens (mirrors normalize_composition).
+        tokens = sorted(composition.replace(",", " ").split())
+        norm_composition = "".join(tokens)
+
+        # 50 K temperature bucket (mirrors temperature_range_bucket with bucket_size=50).
+        t_val   = float(t_series.iloc[i]) if not pd.isna(t_series.iloc[i]) else 0.0
+        t_bucket = int(t_val / 50.0) * 50
+
+        key_str  = f"{paper_id}\x00{norm_composition}\x00{t_bucket}"
+        key_hash = hashlib.sha256(key_str.encode("utf-8", errors="replace")).hexdigest()
+
+        if key_hash in seen:
+            flags[i] = _FLAG_DUPLICATE_SUSPECTED
+            duplicate_count += 1
+        else:
+            seen.add(key_hash)
+
+    stats = {
+        "unique":    int(np.sum(flags == 0)),
+        "duplicate": duplicate_count,
+    }
+    return flags, stats
+
+
 def _emit_audit_telemetry(
     df: pd.DataFrame,
     audit: Dict[str, np.ndarray],
     elapsed_s: float,
+    dedup_stats: Optional[Dict[str, int]] = None,
 ) -> None:
     """
     Emit a structured, academic-grade telemetry report to the logging subsystem.
@@ -255,6 +341,15 @@ def _emit_audit_telemetry(
         logger.info("    P95 zT  : %.4f", p95)
     else:
         logger.warning("    No physically consistent (Tier A/B) states found — check input data quality.")
+    if dedup_stats is not None:
+        logger.info(sep)
+        logger.info("  DEDUPLICATION SUMMARY  (Python SHA-256 / 50 K T-bucket)")
+        logger.info("    Unique records  : %10d", dedup_stats.get("unique", 0))
+        logger.info("    Duplicates found: %10d", dedup_stats.get("duplicate", 0))
+        logger.info(
+            "    Note: production pipeline should use Rust BloomFilter "
+            "(rust_core/src/dedup.rs, FPR≤10⁻⁶)."
+        )
     logger.info(sep)
     logger.info(
         "  PUBLICATION QUALITY ASSESSMENT: %.1f%% Tier A (high confidence), "
@@ -430,6 +525,27 @@ def main(args: argparse.Namespace) -> int:
     )
 
     # -----------------------------------------------------------------------
+    # Stage 2.5: Deduplication (Python SHA-256 / 50 K T-bucket)
+    # Produces FLAG_DUPLICATE_SUSPECTED (bit 10) for records whose dedup key
+    # (paper_id, normalised_composition, T_bucket) already appeared earlier
+    # in the DataFrame. This matches the key construction in dedup.rs.
+    # Pass --skip-dedup to bypass for reproducibility audits.
+    # -----------------------------------------------------------------------
+    if not args.skip_dedup:
+        logger.info(
+            "Running Python-side deduplication (--skip-dedup to bypass) …"
+        )
+        dedup_flags, dedup_stats = _compute_dedup_flags(df, col_t)
+        logger.info(
+            "Deduplication complete: %d unique, %d suspected duplicates.",
+            dedup_stats["unique"], dedup_stats["duplicate"],
+        )
+    else:
+        logger.info("Deduplication bypassed (--skip-dedup flag active).")
+        dedup_flags = np.zeros(len(df), dtype=np.int32)
+        dedup_stats = None
+
+    # -----------------------------------------------------------------------
     # Stage 3: Array Extraction & Physics Audit
     # -----------------------------------------------------------------------
     try:
@@ -464,10 +580,14 @@ def main(args: argparse.Namespace) -> int:
         return 1
     elapsed = time.perf_counter() - t0
 
+    # Merge dedup flags into the physics audit's anomaly_flags array.
+    if np.any(dedup_flags != 0):
+        audit["anomaly_flags"] = (audit["anomaly_flags"].astype(np.int32) | dedup_flags)
+
     # -----------------------------------------------------------------------
     # Stage 4: Telemetry Report
     # -----------------------------------------------------------------------
-    _emit_audit_telemetry(df, audit, elapsed)
+    _emit_audit_telemetry(df, audit, elapsed, dedup_stats=dedup_stats)
 
     # -----------------------------------------------------------------------
     # Stage 5: Persist to Parquet
@@ -542,6 +662,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Force strictly ordered sequential iteration (disables Rayon "
              "work-stealing) for reproducible audit trails.",
+    )
+    exec_group.add_argument(
+        "--skip-dedup",
+        action="store_true",
+        default=False,
+        help="Bypass the Python-side SHA-256 deduplication step. Use for "
+             "reproducibility audits where the input is already deduplicated, "
+             "or to isolate the effect of deduplication on the output dataset. "
+             "Maps to bypass mode in the Rust RecordDeduplicator.",
     )
 
     # --- Column overrides ---
