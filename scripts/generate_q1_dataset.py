@@ -270,6 +270,7 @@ def _emit_audit_telemetry(
     audit: Dict[str, np.ndarray],
     elapsed_s: float,
     dedup_stats: Optional[Dict[str, int]] = None,
+    uncertainty_pct: float = 5.0,
 ) -> None:
     """
     Emit a structured, academic-grade telemetry report to the logging subsystem.
@@ -310,6 +311,11 @@ def _emit_audit_telemetry(
     logger.info("    Total states processed : %10d", n)
     logger.info("    Elapsed time           : %10.2f s  (%.1f k states/s)",
                 elapsed_s, n / elapsed_s / 1000 if elapsed_s > 0 else float("inf"))
+    logger.info(
+        "    Assumed uncertainty    : %10.1f%%  (--uncertainty-pct; "
+        "see VALIDATION_METHODOLOGY.md §13)",
+        uncertainty_pct,
+    )
     logger.info(sep)
     logger.info("  CONFIDENCE TIER DISTRIBUTION")
     for tier_int, label in TIER_LABELS.items():
@@ -587,7 +593,7 @@ def main(args: argparse.Namespace) -> int:
     # -----------------------------------------------------------------------
     # Stage 4: Telemetry Report
     # -----------------------------------------------------------------------
-    _emit_audit_telemetry(df, audit, elapsed, dedup_stats=dedup_stats)
+    _emit_audit_telemetry(df, audit, elapsed, dedup_stats=dedup_stats, uncertainty_pct=args.uncertainty_pct)
 
     # -----------------------------------------------------------------------
     # Stage 5: Persist to Parquet
@@ -671,6 +677,20 @@ def _build_parser() -> argparse.ArgumentParser:
              "reproducibility audits where the input is already deduplicated, "
              "or to isolate the effect of deduplication on the output dataset. "
              "Maps to bypass mode in the Rust RecordDeduplicator.",
+    )
+    exec_group.add_argument(
+        "--uncertainty-pct",
+        type=float,
+        default=5.0,
+        metavar="PCT",
+        help="Assumed relative measurement uncertainty as a percentage (default: 5.0). "
+             "Applied when measurement errors are not reported in the source publication. "
+             "The 5%% default is a conservative estimate consistent with WebPlotDigitizer "
+             "digitization uncertainty (Rohatgi, 2022) and ZEM-3/LFA 457 instrument "
+             "precision. Sensitivity analysis with 2%% and 10%% is recommended as "
+             "supplementary material. This value is logged in the telemetry report for "
+             "reproducibility. Currently informational — use orchestrator.py "
+             "DEFAULT_RELATIVE_UNCERTAINTY for error propagation.",
     )
 
     # --- Column overrides ---
