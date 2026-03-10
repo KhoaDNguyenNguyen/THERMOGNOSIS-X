@@ -81,13 +81,36 @@ logger = logging.getLogger("thermognosis.q1_pipeline")
 # ---------------------------------------------------------------------------
 TIER_LABELS: Dict[int, str] = {1: "A", 2: "B", 3: "C", 4: "Reject"}
 
-# Bitmask flag descriptions for the telemetry report
-FLAG_DESCRIPTIONS: Dict[int, str] = {
-    0b0001: "Negative κ_lattice (FLAG_NEGATIVE_KAPPA_L)",
-    0b0010: "Lorenz number out of bounds (FLAG_LORENZ_OUT_BOUNDS)",
-    0b0100: "zT cross-check mismatch > 10% (FLAG_ZT_MISMATCH)",
-    0b1000: "Algebraic rejection — unphysical state (FLAG_ALGEBRAIC_REJECT)",
+# ---------------------------------------------------------------------------
+# Canonical GAP-03 anomaly flag bitmask descriptions (12-bit scheme).
+# These values MUST be kept in sync with rust_core/src/flags.rs.
+# The legacy 4-bit scheme (0b0001…0b1000) is replaced by the authoritative
+# GAP-03 constants. Python consumers must use the values below.
+# ---------------------------------------------------------------------------
+
+# Hard-reject flags: records with any of these are classified Tier::Reject.
+_FLAG_HARD_REJECT: Dict[int, str] = {
+    1 << 6:  "Seebeck bound exceeded — |S| > 1000 µV/K (FLAG_SEEBECK_BOUND_EXCEED)",
+    1 << 7:  "Sigma bound exceeded — σ > 10⁷ S/m (FLAG_SIGMA_BOUND_EXCEED)",
+    1 << 8:  "Kappa bound exceeded — κ > 100 W/(m·K) (FLAG_KAPPA_BOUND_EXCEED)",
+    1 << 11: "Algebraic rejection — T≤0, σ≤0, or κ≤0 (FLAG_ALGEBRAIC_REJECT)",
 }
+
+# Soft-warning flags: records are kept but downgraded to TierB or TierC.
+_FLAG_SOFT_WARN: Dict[int, str] = {
+    1 << 0:  "Wiedemann-Franz violation (FLAG_WF_VIOLATION)",
+    1 << 1:  "ZT cross-check mismatch > 10% (FLAG_ZT_CROSSCHECK_FAIL)",
+    1 << 2:  "Unknown unit string (FLAG_UNIT_UNKNOWN)",
+    1 << 3:  "σ·ρ inconsistency > 5% (FLAG_SIGMA_RHO_INCON)",
+    1 << 4:  "Low-confidence experiment type (FLAG_LOW_CONFIDENCE_EXP)",
+    1 << 5:  "Insufficient interpolation points (FLAG_INTERP_INSUFFICIENT)",
+    1 << 9:  "FigureID mismatch (FLAG_FIGUREID_MISMATCH)",
+    1 << 10: "Duplicate suspected (FLAG_DUPLICATE_SUSPECTED)",
+    1 << 12: "Temperature out of operational range [100, 2000] K (FLAG_TEMPERATURE_OUT_OF_RANGE)",
+}
+
+# Merged ordered mapping for iteration (hard-reject first, then soft-warn).
+FLAG_DESCRIPTIONS: Dict[int, str] = {**_FLAG_HARD_REJECT, **_FLAG_SOFT_WARN}
 
 # ---------------------------------------------------------------------------
 # Flexible Column Name Auto-Detection
@@ -181,9 +204,10 @@ def _emit_audit_telemetry(
     # --- Anomaly flag breakdown (non-rejected states only) ---
     valid_mask  = tiers < 4
     valid_flags = flags[valid_mask]
+    # Compute counts for every defined flag (hard-reject + soft-warn).
     flag_counts = {
         bit: int(np.sum((valid_flags & bit) != 0))
-        for bit in FLAG_DESCRIPTIONS
+        for bit in list(_FLAG_HARD_REJECT) + list(_FLAG_SOFT_WARN)
     }
 
     # --- zT statistics (Tier A & B only — physically consistent states) ---
@@ -209,10 +233,16 @@ def _emit_audit_telemetry(
         logger.info("    Tier %-6s │ %8d │ %5.1f%% │ %s", label, count, pct, bar)
     logger.info(sep)
     logger.info("  ANOMALY FLAG BREAKDOWN  (physically computable states only)")
-    for bit, desc in FLAG_DESCRIPTIONS.items():
+    logger.info("  -- Hard-Reject Flags (Tier::Reject) --")
+    for bit, desc in _FLAG_HARD_REJECT.items():
         count = flag_counts.get(bit, 0)
         pct   = 100.0 * count / max(int(np.sum(valid_mask)), 1)
-        logger.info("    %-55s │ %7d │ %5.1f%%", desc, count, pct)
+        logger.info("    %-60s │ %7d │ %5.1f%%", desc, count, pct)
+    logger.info("  -- Soft-Warning Flags (TierB / TierC) --")
+    for bit, desc in _FLAG_SOFT_WARN.items():
+        count = flag_counts.get(bit, 0)
+        pct   = 100.0 * count / max(int(np.sum(valid_mask)), 1)
+        logger.info("    %-60s │ %7d │ %5.1f%%", desc, count, pct)
     logger.info(sep)
     logger.info("  FIGURE OF MERIT STATISTICS  (Tier A + B, physically consistent)")
     if len(zt_ab) > 0:
